@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# Linux Baseline v2.0
+# Linux Baseline v2.0.1
 # Author: brx
 # Created: 24 October 2019
-# Updated: 16 December 2020
+# Updated: 22 December 2020
 #
 # This tool:
 # - Collects baseline data for Linux Hosts
@@ -133,7 +133,7 @@ echo >> $file && echo "===================================" &>> $file
 echo "\$ cat /etc/group" >> $file && cat /etc/group >> $file 2>&1
 echo >> $file && echo "===================================" &>> $file
 # Admins
-echo "\$ egrep -i 'wheel|sudo' /etc/group" >> $file && egrep -i 'wheel|sudo' /etc/group >> $file 2>&1
+echo "\$ getent group sudo root wheel adm admin" >> $file && getent group sudo root wheel adm admin >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 # Password status for each user
 echo "\$ cut -d':' -f1 < /etc/passwd | xargs -I {} passwd -S {}" >> $file && cut -d':' -f1 < /etc/passwd | xargs -I {} passwd -S {} >> $file 2>&1
