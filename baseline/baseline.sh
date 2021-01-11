@@ -1,18 +1,19 @@
+
 #!/bin/bash
 
-# Linux Baseline v2.0.1
+# Linux Baseline v2.0.2
 # Author: brx
 # Created: 24 October 2019
-# Updated: 22 December 2020
+# Updated: 11 January 2021
 #
 # This tool:
 # - Collects baseline data for Linux Hosts
 # - Checks for common indicators of compromise
 # - Produces an output file which can be parsed with parse-baseline.sh script
-# 
+#
 # Note: Some of the commands run in this script
 # will only resolve in certain flavors of Linux.
-# Recommend commenting out any lines that are 
+# Recommend commenting out any lines that are
 # irrelevant, cause issues or do not resolve.
 # It is recommened that you use the get-baseline.sh
 #
@@ -20,27 +21,27 @@
 # - No longer required to edit interface name
 # - Redirects both STDOUT and STDERR to file
 # - Outputs location of results file when complete
-# - Removed redundant commands 
+# - Removed redundant commands
 # - Removed deprecated commands (i.e. arp)
 # - Collects uptime, system environment variables
-# - *FUTURE* Multiplatform support 
+# - *FUTURE* Multiplatform support
 #
 # Usage:
 # $ chmod +x baseline.sh
 # $ sudo ./baseline.sh
-# 
+#
 # Output:
 # ./<ip address>_YYYYMMSSDD_HHMMSSZ.txt
-# 
+#
 
 # Help menu
-if [ "$1" = "-h" ] || [ "$1" = "--help" ] ; then	
+if [ "$1" = "-h" ] || [ "$1" = "--help" ] ; then
   echo "usage: baseline.sh [-h]"
   echo ""
   echo 'Collects baseline data for Linux Hosts and checks for common indicators of compromise. Requires manual analysis of output file, which is placed in the current directory as <ip_address>_YYYYMMSSDD_HHMMSSZ.txt. Must be executed as root user.'
   echo ""
   echo "optional arguments:"
-  echo "  -h, --help  show this help message and exit" 
+  echo "  -h, --help  show this help message and exit"
   exit 0
 fi
 
@@ -82,11 +83,13 @@ echo >> $file
 
 # Basic information about the host and Operating system.
 echo "************HOST INFO**************" >> $file
-echo "\$ hostname" >> $file && hostname >> $file 2>&1
+echo "\$ hostnamectl" >> $file && hostnamectl >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ uname -a" >> $file && uname -a >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ cat /etc/*release*" >> $file && cat /etc/*release* >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
+echo "\$ domainname" >> $file && domainname >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ timedatectl" >> $file && timedatectl >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
@@ -96,7 +99,7 @@ echo "\$ uptime" >> $file && uptime >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ free -h" >> $file && free -h >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-echo "\$ lsblk" >> $file && lsblk >> $file 2>&1
+echo "\$ lsblk -a" >> $file && lsblk -a >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ cat /proc/partitions" >> $file && cat /proc/partitions >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
@@ -106,9 +109,17 @@ echo "\$ findmnt --all" >> $file && findmnt --all >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ cat /etc/fstab" >> $file && cat /etc/fstab >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-echo "\$ lsusb" >> $file && lsusb >> $file 2>&1
+# Retrieve hardware info from DMI Table
+echo "\$ dmidecode" >> $file && dmidecode >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-echo "\$ domainname" >> $file && domainname >> $file 2>&1
+# Do not use DMI Table to pull harware information (DMI table can be inaccurate)
+echo "\$ lshw -disable dmi" >> $file && lshw -disable dmi >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
+echo "\$ lsscsi -v" >> $file && lsscsi -v >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
+echo "\$ lspci -v" >> $file && lspci -v >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
+echo "\$ lsusb -v" >> $file && lsusb -v >> $file 2>&1
 echo >> $file
 
 # Checks for environmental contextual and user information
@@ -180,12 +191,14 @@ echo "\$ cat /root/.profile" >> $file && cat /root/.profile >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ cat /root/.bashrc" >> $file && cat /root/.bashrc >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
+echo "\$ cat /root/.bash_logout" >> $file && cat /root/.bash_logout >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
 # The following lines compare user directories to defaults found in /etc/skel
 files=$(ls -A /etc/skel)
 # Root user
 echo '$ for f in $files; do echo "# /root/$f" && diff -y --suppress-common-lines /etc/skel/$f ~/$f && echo; done' >> $file && for f in $files; do echo "# /root/$f" && diff -y --suppress-common-lines /etc/skel/$f ~/$f && echo; done >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-# All users 
+# All users
 echo '$ for u in $users; do for f in $files; do echo "# /home/$u/$f" && diff -y --suppress-common-lines /etc/skel/$f /home/$u/$f && echo; done; done' >> $file && for u in $users; do for f in $files; do echo "# /home/$u/$f" && diff -y --suppress-common-lines /etc/skel/$f /home/$u/$f && echo; done; done >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ cat /etc/rc.local" >> $file && cat /etc/rc.local >> $file 2>&1
@@ -198,7 +211,11 @@ echo "\$ ls -latR /etc/cron.*" >> $file && ls -latR /etc/cron* >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ ls -latR /etc/init.d" >> $file && ls -latR /etc/init.d >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
+echo "\$ ls -latR /etc/init/*" >> $file && ls -latR /etc/init/* >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
 echo "\$ ls -latR /etc/rc.d/init.d" >> $file && ls -latR /etc/rc.d/init.d >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
+echo "\$ ls -latR /etc/systemd/system" >> $file && ls -latR /etc/systemd/system >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 # Below line shows any user binaries created with within the past 180 days (edit range as needed)
 echo "\$ find /bin /sbin /usr/{bin,sbin} /usr/local/{bin,sbin} -maxdepth 1 -mtime 180" >> $file && find /bin /sbin /usr/{bin,sbin} /usr/local/{bin,sbin} -maxdepth 1 -mtime 180 >> $file 2>&1
@@ -232,7 +249,11 @@ echo "\$ ss -punt" >> $file && ss -punt >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ cat /etc/hosts" >> $file && cat /etc/hosts >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-echo "\$ iptables -L" >> $file && iptables -L >> $file 2>&1
+echo "\$ smbclient -L 127.0.0.1 -U%" >> $file && smbclient -L 127.0.0.1 -U% >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
+echo "\$ showmount -e 127.0.0.1" >> $file && showmount -e 127.0.0.1 >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
+echo "\$ iptables -L -n -v" >> $file && iptables -L -n -v >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ iptables -S" >> $file && iptables -S >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
@@ -245,7 +266,7 @@ echo >> $file && echo "===================================" >> $file
 echo "\$ ufw show raw" >> $file && ufw show raw >> $file 2>&1
 echo >> $file
 
-# Note: The output of the following few commands is significant. 
+# Note: The output of the following few commands is significant.
 echo "*******PROCESS SERVICE SOFTWARE INFO*********" >> $file
 echo "\$ ps -elf" >> $file && ps -elf >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
@@ -253,17 +274,17 @@ echo "\$ pstree" >> $file && pstree >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ systemctl list-units -all --full" >> $file && systemctl list-units -all --full >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-echo "\$ systemctl status *.service" >> $file && systemctl status *.service >> $file 2>&1
+# echo "\$ systemctl status *.service" >> $file && systemctl status *.service >> $file 2>&1
+# echo >> $file && echo "===================================" >> $file
+echo "\$ rpm -q --all | sort" >> $file && rpm -q --all | sort>> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-echo "\$ rpm -q --all" >> $file && rpm -q --all >> $file 2>&1
+echo "\$ dpkg -l | sort" >> $file && dpkg -l | sort >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-echo "\$ dpkg -l" >> $file && dpkg -l >> $file 2>&1
-echo >> $file && echo "===================================" >> $file
-echo "\$ lsmod" >> $file && lsmod >> $file 2>&1
+echo "\$ lsmod | sort" >> $file && lsmod | sort >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 # Verbose for all Loaded Kernel Modules (Drivers)
 # Makes a list of all of the modules and then pipes them to modinfo
-mods=`lsmod | cut -d " " -f1`
+mods=`lsmod | sort | cut -d " " -f1`
 mods=`echo $mods | cut -d " " -f 2-`
 echo '$ for m in $mods; do echo -e "# modinfo $m" && modinfo $m && echo ""; done' >> $file && for m in $mods; do echo -e "# modinfo $m" && modinfo $m && echo ""; done >> $file 2>&1
 #echo "\$ ls -latR ~" >> $file && ls -latR ~ >> $file 2>&1
@@ -285,7 +306,7 @@ echo "\$ cat /etc/rsyslog.conf" >> $file && cat /etc/rsyslog.conf >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ cat /etc/systemd/journald.conf" >> $file && cat /etc/systemd/journald.conf >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-# Security Context 
+# Security Context
 echo "\$ sestatus" >> $file && sestatus >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ getsebool -a" >> $file && getsebool -a >> $file 2>&1
@@ -316,11 +337,6 @@ echo >> $file && echo "===================================" >> $file
 echo "\$ cat /etc/cron.allow" >> $file && cat /etc/cron.allow >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ cat /etc/cron.deny" >> $file && cat /etc/cron.deny >> $file 2>&1
-echo >> $file && echo "===================================" >> $file
-echo "\$ cat /etc/cron.allow" >> $file && cat /etc/cron.allow >> $file 2>&1
-echo >> $file && echo "===================================" >> $file
-echo "\$ cat /etc/cron.deny" >> $file && cat /etc/cron.deny >> $file 2>&1
-
 echo >> $file
 
 echo -e "Done!\n\nResults located at $(realpath $file)\n"
