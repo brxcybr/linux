@@ -45,5 +45,4 @@ fi
 username=$USER
 
 # Note: Place IP of target(s) after 'for ip in <ip1> <ip2> <ip3>'
-for ip in 10.225.2.80; do scp ./baseline.sh $username@$ip:/tmp && ssh -t $username@$ip "sudo chmod +x /tmp/baseline.sh && sudo /tmp/baseline.sh" && ssh -t $username@$ip "sudo chown $username ./$ip* || sudo chown $username ./_*Z.txt" && scp $username@$ip:./$ip* ./results || scp $username@$ip:./_*Z.txt ./results && ssh -t $username@$ip "sudo rm /tmp/baseline.sh $ip* || sudo rm ./_*Z.txt"; done
-
+for ip in 10.225.2.80; do scp ./baseline.sh $username@$ip:/tmp && ssh -t $username@$ip "sudo chmod +x /tmp/baseline.sh && sudo /tmp/baseline.sh" && ssh -t $username@$ip "sudo chown $username ./$ip*" && scp $username@$ip:./$ip* ./results && ssh -t $username@$ip "sudo rm /tmp/baseline.sh ./$ip*"; done

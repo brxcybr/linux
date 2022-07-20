@@ -2,7 +2,7 @@
 
 # Author: brx
 # Created: 8 December 2020
-# Updated: 9 December 2020
+# Updated: 12 January 2021
 #
 # This tool:
 # - Splits files created by 'baseline.sh' script by command

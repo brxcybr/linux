@@ -1,19 +1,18 @@
-
 #!/bin/bash
 
 # Linux Baseline v2.0.2
 # Author: brx
 # Created: 24 October 2019
-# Updated: 11 January 2021
+# Updated: 12 January 2021
 #
 # This tool:
 # - Collects baseline data for Linux Hosts
 # - Checks for common indicators of compromise
 # - Produces an output file which can be parsed with parse-baseline.sh script
-#
+# 
 # Note: Some of the commands run in this script
 # will only resolve in certain flavors of Linux.
-# Recommend commenting out any lines that are
+# Recommend commenting out any lines that are 
 # irrelevant, cause issues or do not resolve.
 # It is recommened that you use the get-baseline.sh
 #
@@ -21,27 +20,27 @@
 # - No longer required to edit interface name
 # - Redirects both STDOUT and STDERR to file
 # - Outputs location of results file when complete
-# - Removed redundant commands
+# - Removed redundant commands 
 # - Removed deprecated commands (i.e. arp)
 # - Collects uptime, system environment variables
-# - *FUTURE* Multiplatform support
+# - *FUTURE* Multiplatform support 
 #
 # Usage:
 # $ chmod +x baseline.sh
 # $ sudo ./baseline.sh
-#
+# 
 # Output:
 # ./<ip address>_YYYYMMSSDD_HHMMSSZ.txt
-#
+# 
 
 # Help menu
-if [ "$1" = "-h" ] || [ "$1" = "--help" ] ; then
+if [ "$1" = "-h" ] || [ "$1" = "--help" ] ; then	
   echo "usage: baseline.sh [-h]"
   echo ""
   echo 'Collects baseline data for Linux Hosts and checks for common indicators of compromise. Requires manual analysis of output file, which is placed in the current directory as <ip_address>_YYYYMMSSDD_HHMMSSZ.txt. Must be executed as root user.'
   echo ""
   echo "optional arguments:"
-  echo "  -h, --help  show this help message and exit"
+  echo "  -h, --help  show this help message and exit" 
   exit 0
 fi
 
@@ -94,6 +93,8 @@ echo >> $file && echo "===================================" >> $file
 echo "\$ timedatectl" >> $file && timedatectl >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ ntpstat" >> $file && ntpstat >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
+echo "\$ who -a" >> $file && who -a >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ uptime" >> $file && uptime >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
@@ -156,7 +157,7 @@ echo "\$ w" >> $file && w >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ tty" >> $file && tty >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-echo "\$ lastlog" >> $file && lastlog >> $file 2>&1
+echo "\$ lastlog | sort" >> $file && lastlog | sort >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ last -f /var/log/wtmp" >> $file && last -f /var/log/wtmp >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
@@ -196,10 +197,10 @@ echo >> $file && echo "===================================" >> $file
 # The following lines compare user directories to defaults found in /etc/skel
 files=$(ls -A /etc/skel)
 # Root user
-echo '$ for f in $files; do echo "# /root/$f" && diff -y --suppress-common-lines /etc/skel/$f ~/$f && echo; done' >> $file && for f in $files; do echo "# /root/$f" && diff -y --suppress-common-lines /etc/skel/$f ~/$f && echo; done >> $file 2>&1
+echo '$ for f in $files; do echo "# /root/$f" && diff -y --suppress-common-lines /etc/skel/$f ~/$f && echo || echo; done' >> $file && for f in $files; do echo "# /root/$f" && diff -y --suppress-common-lines /etc/skel/$f ~/$f && echo || echo; done >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-# All users
-echo '$ for u in $users; do for f in $files; do echo "# /home/$u/$f" && diff -y --suppress-common-lines /etc/skel/$f /home/$u/$f && echo; done; done' >> $file && for u in $users; do for f in $files; do echo "# /home/$u/$f" && diff -y --suppress-common-lines /etc/skel/$f /home/$u/$f && echo; done; done >> $file 2>&1
+# All users 
+echo '$ for u in $users; do for f in $files; do echo "# /home/$u/$f" && diff -y --suppress-common-lines /etc/skel/$f /home/$u/$f && echo || echo; done; done' >> $file && for u in $users; do for f in $files; do echo "# /home/$u/$f" && diff -y --suppress-common-lines /etc/skel/$f /home/$u/$f && echo || echo; done; done >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ cat /etc/rc.local" >> $file && cat /etc/rc.local >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
@@ -209,23 +210,28 @@ echo "\$ cat /etc/crontab" >> $file && cat /etc/crontab >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ ls -latR /etc/cron.*" >> $file && ls -latR /etc/cron* >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
+echo "\$ ls -latR /var/spool/cron" >> $file && ls -latR /var/spool/cron >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
 echo "\$ ls -latR /etc/init.d" >> $file && ls -latR /etc/init.d >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ ls -latR /etc/init/*" >> $file && ls -latR /etc/init/* >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-echo "\$ ls -latR /etc/rc.d/init.d" >> $file && ls -latR /etc/rc.d/init.d >> $file 2>&1
+echo "\$ ls -latR /etc/rc.d" >> $file && ls -latR /etc/rc.d >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ ls -latR /etc/systemd/system" >> $file && ls -latR /etc/systemd/system >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 # Below line shows any user binaries created with within the past 180 days (edit range as needed)
-echo "\$ find /bin /sbin /usr/{bin,sbin} /usr/local/{bin,sbin} -maxdepth 1 -mtime 180" >> $file && find /bin /sbin /usr/{bin,sbin} /usr/local/{bin,sbin} -maxdepth 1 -mtime 180 >> $file 2>&1
+echo "\$ find /bin /sbin /usr/{bin,sbin} /usr/local/{bin,sbin} -maxdepth 1 -mtime 180 | xargs -r ls -l" >> $file && find /bin /sbin /usr/{bin,sbin} /usr/local/{bin,sbin} -maxdepth 1 -mtime 180 | xargs -r ls -l >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
+# Find orphaned files 
+echo "\$ find / -nouser | xargs -r ls -l" >> $file && find / -nouser | xargs -r ls -l >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 # World writable directories and files
-echo "\$ find / -perm -0002 -type d -print" >> $file && find / -perm -0002 -type d -print >> $file 2>&1
+echo "\$ find / -perm -0002 -type d -print | xargs -r ls -ld" >> $file && find / -perm -0002 -type d -print | xargs -r ls -ld >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 # Below line edited to remove excessive results from /proc and /sys, remove if desired
-echo "\$ find / -perm -0002 -type f -print | grep -v '/proc/' | grep -v '/sys/'" >> $file && /usr/bin/find / -perm -0002 -type f -print | grep -v '/proc/' | grep -v '/sys/' >> $file 2>&1
-#echo "\$ find / -perm -0002 -type f -print" >> $file && /usr/bin/find / -perm -0002 -type f -print >> $file
+echo "\$ find / -perm -0002 -type f -print | grep -v '/proc/' | grep -v '/sys/' | xargs -r ls -l" >> $file && find / -perm -0002 -type f -print | grep -v '/proc/' | grep -v '/sys/' | xargs -r ls -l >> $file 2>&1
+#echo "\$ find / -perm -0002 -type f -print | xargs r ls -l" >> $file && find / -perm -0002 -type f -print | xargs -r ls -l >> $file
 echo >> $file
 
 # Network and Firewall Situational Awareness
@@ -241,13 +247,15 @@ echo "\$ ip neigh" >> $file && ip neigh >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ route -n" >> $file && route -n >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-echo "\$ netstat -auntp" >> $file && netstat -auntp >> $file 2>&1
+echo "\$ netstat -autpel --numeric-hosts --numeric-ports | sort" >> $file && netstat -autpel --numeric-hosts --numeric-ports | sort >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ lsof -Pni" >> $file && lsof -Pni >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ ss -punt" >> $file && ss -punt >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ cat /etc/hosts" >> $file && cat /etc/hosts >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
+echo "\$ rpcinfo -p" >> $file && rpcinfo -p >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ smbclient -L 127.0.0.1 -U%" >> $file && smbclient -L 127.0.0.1 -U% >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
@@ -266,9 +274,9 @@ echo >> $file && echo "===================================" >> $file
 echo "\$ ufw show raw" >> $file && ufw show raw >> $file 2>&1
 echo >> $file
 
-# Note: The output of the following few commands is significant.
+# Note: The output of the following few commands is significant. 
 echo "*******PROCESS SERVICE SOFTWARE INFO*********" >> $file
-echo "\$ ps -elf" >> $file && ps -elf >> $file 2>&1
+echo "\$ ps -elf --sort pid" >> $file && ps -elf --sort pid >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ pstree" >> $file && pstree >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
@@ -276,7 +284,7 @@ echo "\$ systemctl list-units -all --full" >> $file && systemctl list-units -all
 echo >> $file && echo "===================================" >> $file
 # echo "\$ systemctl status *.service" >> $file && systemctl status *.service >> $file 2>&1
 # echo >> $file && echo "===================================" >> $file
-echo "\$ rpm -q --all | sort" >> $file && rpm -q --all | sort>> $file 2>&1
+echo "\$ rpm -q --all | sort" >> $file && rpm -q --all | sort >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ dpkg -l | sort" >> $file && dpkg -l | sort >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
@@ -306,14 +314,14 @@ echo "\$ cat /etc/rsyslog.conf" >> $file && cat /etc/rsyslog.conf >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ cat /etc/systemd/journald.conf" >> $file && cat /etc/systemd/journald.conf >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-# Security Context
+# Security Context 
 echo "\$ sestatus" >> $file && sestatus >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ getsebool -a" >> $file && getsebool -a >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-echo "\$ ps -efZ | grep -v unconfined" >> $file && ps -efZ | grep -v unconfined >> $file 2>&1
+echo "\$ ps -eo pid,user,comm,label --sort pid | grep -v unconfined" >> $file && ps -eo pid,user,comm,label --sort pid | grep -v unconfined >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
-echo "\$ netstat -Z | grep -v unconfined" >> $file && netstat -Z | grep -v unconfined >> $file 2>&1
+echo "\$ netstat -auntpelZ | grep -v unconfined | sort" >> $file && netstat -auntpelZ | grep -v unconfined | sort >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ aa-status" >> $file && aa-status >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
