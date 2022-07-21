@@ -2,13 +2,15 @@
 # Linux Baseline Script
 The purpose of this tool is to quickly gather and analyze Linux endpoint data to assess its security posture and check for evidence of malicious activity or compromise.
 
+In this context, a _**baseline**_ is a snapshot of the device's current running state and configurations. Regularly capturing a baseline of each device in a networked environment allows a security analyst or administator to _track changes over time_ and _investigate unexpected deviations_ when found. 
+
 ### Inside the bundle
 This Linux baseline capability consists of three separate tools:
 - _**baseline.sh**_ - Standalone baseline script, written in BASH
 - _**get-baseline.sh**_ - Deployment script (uses SSH)
 - _**parse-baseline.sh**_ - Parsing/Comparison script that lets you compare output files
 
-## Linux Baseline Script (baseline.sh):
+## Linux Baseline Script (_baseline.sh_):
 - Collects baseline data for Linux Hosts (supports ALL major flavors of Linux)
 - Checks for common indicators of compromise
 - Produces an output file which can be parsed with parse-baseline.sh script
