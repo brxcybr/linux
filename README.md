@@ -1,8 +1,8 @@
 
-### Linux Baseline Script
+# Linux Baseline Script
 The purpose of this tool is to quickly gather and analyze Linux endpoint data to assess its security posture and check for evidence of malicious activity or compromise.
 
-## Inside the bundle
+### Inside the bundle
 This Linux baseline capability consists of three separate tools:
 - _**baseline.sh**_ - Standalone baseline script, written in BASH
 - _**get-baseline.sh**_ - Deployment script (uses SSH)
@@ -17,7 +17,7 @@ This Linux baseline capability consists of three separate tools:
 - _Note_: Should be executed with root privileges in order to gather all of the required data 
 
 
-# Updates in v2.0.2:
+### Updates in v2.0.2:
 - No longer required to edit interface name
 - Redirects both STDOUT and STDERR to file
 - Outputs location of results file when complete
@@ -25,13 +25,13 @@ This Linux baseline capability consists of three separate tools:
 - Removed deprecated commands (i.e. arp)
 - Collects uptime, system environment variables
 
-# Usage:
+### Usage:
 ```
 $ chmod +x baseline.sh
 $ sudo ./baseline.sh
 ```
  
-# Output:
+### Output:
 `./<ip address>_YYYYMMSSDD_HHMMSSZ.txt` 
 
  
@@ -43,7 +43,7 @@ $ sudo ./baseline.sh
 - Works best when shared SSH keys are utilized
 - _Note_ : For this to work, ensure that you have the correct IP in the field below, and ensure that baseline.sh is in your current working directory. If the device is not integrated into LDAP, you will have to change the $ip variable to <username>@ip for it to work.
 
-# Usage:
+### Usage:
 1. First, modify _line 48_ of the script and set the IP(s) you want to collect data from. Multiple IP addresses should be separated by single space.
 ```
 $ vi get-baseline.sh
@@ -64,14 +64,14 @@ $ .\get-baseline.sh
 - If a second filename is supplied, compares two files
 - Reduces analytical time by allowing you to quickly identify changes over time
 
-# Usage:
+### Usage:
 ```
 $ chmod +x parse-baseline.sh
 $ parse-baseline.sh file1
 $ parse-baseline.sh file1 file2
 ```
 
-# Output:
+### Output:
 ```
 ./<ip address>/<date>/
 ./<ip address>/parse_baseline_YYYYMMDD_HHMMSSZ.txt
