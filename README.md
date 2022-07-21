@@ -44,14 +44,21 @@ $ sudo ./baseline.sh
 - _Note_ : For this to work, ensure that you have the correct IP in the field below, and ensure that baseline.sh is in your current working directory. If the device is not integrated into LDAP, you will have to change the $ip variable to <username>@ip for it to work.
 
 # Usage:
-`$ chmod +x get-baseline.sh`
+1. First, modify _line 48_ of the script and set the IP(s) you want to collect data from. Multiple IP addresses should be separated by single space.
+```
+$ vi get-baseline.sh
+# Once the file opens, type ':48' to place the cursor on line 48
+# press 'i' to enter INSERT mode
+# When finished editing, press ':wq' to save and quit
+```
 
-# Modify this file and set the IP(s) you want to pull from
+2. Next, set the execute permission for the script and execute 
 ```
-$ vim get-baseline.sh
-$ ./get-baseline.sh
+$ chmod +x get-baseline.sh
+$ .\get-baseline.sh
 ```
- 
+3. The collected results will save to a folder in the local directory labeled _results_. 
+
 ## Parsing/Analysis Script (_parse-baseline.sh_)
 - Splits files created by 'baseline.sh' script by command
 - If a second filename is supplied, compares two files
