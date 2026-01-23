@@ -139,7 +139,7 @@ baseline_db/*.sqlite3-wal
 baseline_db/*.db
 
 # Baseline results and survey data
-results/
+results/*.txt
 survey/
 reports/
 *.txt
