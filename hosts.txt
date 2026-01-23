@@ -1,0 +1,8 @@
+# Example hosts file for remote baseline collection
+# One host per line (IP address, hostname, or FQDN)
+# Lines starting with # are ignored
+#
+# Examples:
+# 10.0.0.5
+# server-a
+# server-b.example.com

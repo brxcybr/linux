@@ -127,3 +127,50 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Database files and artifacts
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.db
+baseline_db/*.sqlite3
+baseline_db/*.sqlite3-shm
+baseline_db/*.sqlite3-wal
+baseline_db/*.db
+
+# Baseline results and survey data
+results/
+survey/
+reports/
+*.txt
+!baseline/*.sh
+!baseline/*.md
+!results/.gitkeep
+!hosts.txt
+
+# Host inventory CSV (may contain sensitive data)
+# Allow example template, but ignore actual data files
+*_host_info.csv
+!host_inventory.csv
+
+# Python cache
+baseline_db/__pycache__/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# macOS system folders
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# macOS metadata on network/USB volumes
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
