@@ -712,6 +712,12 @@ CREATE TABLE IF NOT EXISTS run_firewall_rules (
   PRIMARY KEY (run_id, source, rule)
 );
 
+-- nftables ruleset (raw output from nft list ruleset)
+CREATE TABLE IF NOT EXISTS run_nft_ruleset (
+  run_id INTEGER PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+  raw_text TEXT NOT NULL
+);
+
 -- Generic facts bucket for incremental parsing without schema churn.
 CREATE TABLE IF NOT EXISTS run_facts (
   run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
@@ -740,6 +746,115 @@ CREATE TABLE IF NOT EXISTS run_login_defs_kv (
   k TEXT NOT NULL,
   v TEXT,
   PRIMARY KEY (run_id, k)
+);
+
+-- /proc/cmdline kernel command line parameters (key/value)
+CREATE TABLE IF NOT EXISTS run_kernel_cmdline_kv (
+  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  k TEXT NOT NULL,
+  v TEXT,
+  PRIMARY KEY (run_id, k)
+);
+
+-- sysctl kernel parameters (key/value)
+CREATE TABLE IF NOT EXISTS run_sysctl_kv (
+  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  k TEXT NOT NULL,
+  v TEXT,
+  PRIMARY KEY (run_id, k)
+);
+
+-- Secure boot status (mokutil --sb-state)
+CREATE TABLE IF NOT EXISTS run_secure_boot (
+  run_id INTEGER PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+  secure_boot_enabled INTEGER NOT NULL DEFAULT 0,  -- 1=enabled, 0=disabled
+  raw_text TEXT NOT NULL
+);
+
+-- LD_PRELOAD entries (from /etc/ld.so.preload and environment)
+CREATE TABLE IF NOT EXISTS run_ld_preload_entries (
+  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  entry TEXT NOT NULL,
+  PRIMARY KEY (run_id, entry)
+);
+
+-- File capabilities (getcap output)
+CREATE TABLE IF NOT EXISTS run_file_capabilities (
+  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  caps TEXT NOT NULL,
+  PRIMARY KEY (run_id, path)
+);
+
+-- Container runtime summary (docker/podman info)
+CREATE TABLE IF NOT EXISTS run_container_summary (
+  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  runtime TEXT NOT NULL,  -- docker | podman
+  k TEXT NOT NULL,
+  v TEXT,
+  PRIMARY KEY (run_id, runtime, k)
+);
+
+-- SSH host keys (fingerprints from ssh-keygen -lf)
+CREATE TABLE IF NOT EXISTS run_ssh_host_keys (
+  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  bits INTEGER,
+  fingerprint TEXT NOT NULL,
+  key_file TEXT,
+  key_type TEXT NOT NULL,
+  raw_line TEXT NOT NULL,
+  PRIMARY KEY (run_id, key_type, fingerprint)
+);
+
+-- SSH daemon configuration (sshd -T output, key/value)
+CREATE TABLE IF NOT EXISTS run_sshd_config_kv (
+  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  k TEXT NOT NULL,
+  v TEXT,
+  PRIMARY KEY (run_id, k)
+);
+
+-- Sudoers rules (from visudo -c and cat /etc/sudoers)
+CREATE TABLE IF NOT EXISTS run_sudoers_rules (
+  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  rule_text TEXT NOT NULL,
+  PRIMARY KEY (run_id, rule_text)
+);
+
+-- Authentication log statistics (recent auth failures, etc.)
+CREATE TABLE IF NOT EXISTS run_auth_log_stats (
+  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  source TEXT NOT NULL,  -- journalctl_ssh | auth_log | secure
+  failed_password_count INTEGER NOT NULL DEFAULT 0,
+  invalid_user_count INTEGER NOT NULL DEFAULT 0,
+  accepted_password_count INTEGER NOT NULL DEFAULT 0,
+  accepted_publickey_count INTEGER NOT NULL DEFAULT 0,
+  sudo_count INTEGER NOT NULL DEFAULT 0,
+  error_count INTEGER NOT NULL DEFAULT 0,
+  raw_line_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (run_id, source)
+);
+
+-- Systemd timers (systemctl list-timers)
+CREATE TABLE IF NOT EXISTS run_systemd_timers (
+  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  next TEXT,
+  left TEXT,
+  last TEXT,
+  passed TEXT,
+  unit TEXT NOT NULL,
+  activates TEXT,
+  raw_line TEXT NOT NULL,
+  PRIMARY KEY (run_id, unit)
+);
+
+-- Systemd enabled unit files (systemctl list-unit-files --state=enabled)
+CREATE TABLE IF NOT EXISTS run_systemd_enabled_unit_files (
+  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  unit_file TEXT NOT NULL,
+  state TEXT,
+  preset TEXT,
+  PRIMARY KEY (run_id, unit_file)
 );
 
 -- Security findings framework
@@ -1161,13 +1276,14 @@ SELECT
   m.size,
   m.used_by_count,
   m.used_by,
-  mi.description,
-  mi.license
+  mi_desc.v as description,
+  mi_lic.v as license
 FROM module_counts mc
 JOIN run_lsmod m ON m.module = mc.module
 JOIN runs r ON r.run_id = m.run_id
 JOIN v_asset_current ac ON ac.asset_id = r.asset_id
-LEFT JOIN run_modinfo_kv mi ON mi.run_id = r.run_id AND mi.module = m.module AND mi.k = 'description'
+LEFT JOIN run_modinfo_kv mi_desc ON mi_desc.run_id = r.run_id AND mi_desc.module = m.module AND mi_desc.k = 'description'
+LEFT JOIN run_modinfo_kv mi_lic ON mi_lic.run_id = r.run_id AND mi_lic.module = m.module AND mi_lic.k = 'license'
 ORDER BY mc.host_count, mc.total_instances DESC;
 
 -- Mount points that are unique to specific hosts (from lsblk mountpoints)

@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Linux Baseline v2.0.2
-# Author: brx
+# Author: brxcybr
 # Created: 24 October 2019
-# Updated: 12 January 2021
+# Updated: 23 January 2026
 #
 # This tool:
 # - Collects baseline data for Linux Hosts
@@ -133,6 +133,8 @@ while [ $# -gt 0 ]; do
       ;;
     --results-dir)
       REMOTE_RESULTS_DIR="$2"
+      # Also set OUTDIR for local mode (allow --results-dir to work in both modes)
+      OUTDIR="$2"
       shift 2
       ;;
     --ask-ssh-pass)
@@ -178,8 +180,11 @@ if [ "$MODE" = "remote" ]; then
     echo ""
   fi
   if [ "$ASK_SUDO_PASS" = "1" ] && [ -z "$REMOTE_SUDO_PASS" ]; then
-    read -s -p "sudo password (leave blank for interactive sudo): " REMOTE_SUDO_PASS
+    read -s -p "sudo password (required for remote execution): " REMOTE_SUDO_PASS
     echo ""
+    if [ -z "$REMOTE_SUDO_PASS" ]; then
+      echo "Warning: No sudo password provided. Remote execution may fail if sudo requires a password." >&2
+    fi
   fi
 else
   # local mode: require root, but optionally support sudo -S if a sudo password was provided
@@ -270,10 +275,15 @@ remote_run() {
     # Execute baseline and write output to /tmp on remote
     local ssh_out=""
     if [ -n "$REMOTE_SUDO_PASS" ]; then
-      # One sudo invocation; feed password via stdin (-S). Some environments may still require tty.
-      ssh_out=$(printf '%s\n' "$REMOTE_SUDO_PASS" | "${ssh_opts[@]}" -tt "$remote" "sudo -S -p '' bash -c \"chmod +x '${remote_script}'; '${remote_script}' --ip-mode '${IP_MODE}' --outdir /tmp\" " 2>&1)
+      # Feed password to sudo -S. Pass it as argument to avoid read hanging.
+      # Use -n to prevent SSH from reading stdin, which can cause hangs
+      ssh_out=$(printf '%s\n' "$REMOTE_SUDO_PASS" | "${ssh_opts[@]}" -n -tt "$remote" "echo \"\$0\" | sudo -S -p \"\" bash -c \"chmod +x '\''${remote_script}'\''; '\''${remote_script}'\'' --ip-mode '\''${IP_MODE}'\'' --outdir /tmp\"" "$REMOTE_SUDO_PASS" 2>&1)
     else
-      ssh_out=$("${ssh_opts[@]}" -tt "$remote" "sudo chmod +x '${remote_script}' && sudo '${remote_script}' --ip-mode '${IP_MODE}' --outdir /tmp" 2>&1)
+      # Without password, try interactive sudo (may fail if no TTY or requiretty is set)
+      # Warn user they should use --ask-sudo-pass
+      echo "Warning: No sudo password provided. Attempting interactive sudo (may fail)." >&2
+      echo "Tip: Use --ask-sudo-pass to provide password non-interactively." >&2
+      ssh_out=$("${ssh_opts[@]}" -n -tt "$remote" "sudo chmod +x '${remote_script}' && sudo '${remote_script}' --ip-mode '${IP_MODE}' --outdir /tmp" 2>&1)
     fi
     echo "$ssh_out"
 
@@ -282,8 +292,19 @@ remote_run() {
     result_path=$(echo "$ssh_out" | sed -n 's/^Results located at //p' | tail -n 1)
     if [ -z "$result_path" ]; then
       echo "Could not determine result file path for $host"
-      "${ssh_opts[@]}" -tt "$remote" "sudo rm -f '${remote_script}'" >/dev/null 2>&1 || true
+      "${ssh_opts[@]}" -n -T "$remote" "sudo rm -f '${remote_script}'" >/dev/null 2>&1 || true
+      # Close SSH connection before continuing
+      "${ssh_opts[@]}" -O exit "$remote" >/dev/null 2>&1 || true
       continue
+    fi
+
+    # Chown results file to remote user so scp can retrieve it
+    # The file was created as root, but we need it owned by REMOTE_USER for scp
+    # Use -n to prevent SSH from reading stdin, and -T to disable TTY (not needed for chown)
+    if [ -n "$REMOTE_SUDO_PASS" ]; then
+      printf '%s\n' "$REMOTE_SUDO_PASS" | "${ssh_opts[@]}" -n -T "$remote" "echo \"\$0\" | sudo -S -p \"\" chown \"${REMOTE_USER}:${REMOTE_USER}\" \"${result_path}\"" "$REMOTE_SUDO_PASS" >/dev/null 2>&1 || true
+    else
+      "${ssh_opts[@]}" -n -T "$remote" "sudo chown \"${REMOTE_USER}:${REMOTE_USER}\" \"${result_path}\"" >/dev/null 2>&1 || true
     fi
 
     # Copy results back
@@ -291,8 +312,16 @@ remote_run() {
     result_name=$(basename "$result_path")
     "${scp_opts[@]}" "${remote}:${result_path}" "${REMOTE_RESULTS_DIR}/${result_name}" || echo "scp of results failed for $host"
 
-    # Cleanup
-    "${ssh_opts[@]}" -tt "$remote" "sudo rm -f '${remote_script}' '${result_path}'" >/dev/null 2>&1 || true
+    # Cleanup: remove script and results file (both may be root-owned, so use sudo)
+    # Use -n to prevent SSH from reading stdin, and -T to disable TTY (not needed for rm)
+    if [ -n "$REMOTE_SUDO_PASS" ]; then
+      printf '%s\n' "$REMOTE_SUDO_PASS" | "${ssh_opts[@]}" -n -T "$remote" "echo \"\$0\" | sudo -S -p \"\" rm -f '${remote_script}' '${result_path}'" "$REMOTE_SUDO_PASS" >/dev/null 2>&1 || true
+    else
+      "${ssh_opts[@]}" -n -T "$remote" "sudo rm -f '${remote_script}' '${result_path}'" >/dev/null 2>&1 || true
+    fi
+    
+    # Explicitly close SSH ControlMaster connection for this host to prevent hangs
+    "${ssh_opts[@]}" -O exit "$remote" >/dev/null 2>&1 || true
   done
 }
 
@@ -677,7 +706,26 @@ else
   find / -xdev "${FIND_PRUNE_ARGS[@]}" -type f -perm -2000 -exec ls -l {} + >> $file 2>/dev/null
 fi
 echo >> $file && echo "===================================" >> $file
-echo "\$ getcap -r /" >> $file && { command -v getcap >/dev/null 2>&1 && { command -v timeout >/dev/null 2>&1 && timeout "${FIND_TIMEOUT_SECS}s" getcap -r / 2>/dev/null || getcap -r / 2>/dev/null; } || echo "getcap not installed"; } >> $file 2>&1
+# getcap -r / can hang on network mounts, containers, /proc, /sys, etc.
+# Instead, scan important system paths individually to avoid hangs
+if command -v getcap >/dev/null 2>&1; then
+  echo "\$ getcap -r /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin /opt 2>/dev/null" >> $file
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${FIND_TIMEOUT_SECS}s" getcap -r /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin /opt 2>/dev/null >> $file 2>&1 || true
+  else
+    getcap -r /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin /opt 2>/dev/null >> $file 2>&1 || true
+  fi
+  # Also check /etc and /root for any capability-enabled files
+  echo "\$ getcap -r /etc /root 2>/dev/null" >> $file
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 30s getcap -r /etc /root 2>/dev/null >> $file 2>&1 || true
+  else
+    getcap -r /etc /root 2>/dev/null >> $file 2>&1 || true
+  fi
+else
+  echo "\$ getcap -r /" >> $file
+  echo "getcap not installed" >> $file
+fi
 echo >> $file
 
 echo "************LOGON HISTORY & AUTH LOGS**************" >> $file
@@ -701,8 +749,30 @@ echo "\$ tail -n 200 /var/log/secure" >> $file && tail -n 200 /var/log/secure >>
 echo >> $file
 
 # If executed via sudo, try to return ownership to the invoking user so deployment can scp cleanly.
-if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ] ; then
-  chown "$SUDO_USER":"$SUDO_USER" "$file" 2>/dev/null || true
+# Try multiple methods to get the original user
+ORIG_USER=""
+if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+  ORIG_USER="$SUDO_USER"
+elif [ -n "$SUDO_UID" ]; then
+  # Fallback: get username from UID
+  ORIG_USER=$(getent passwd "$SUDO_UID" 2>/dev/null | cut -d: -f1)
+fi
+# If still no user, try logname (works if TTY is available)
+if [ -z "$ORIG_USER" ] || [ "$ORIG_USER" = "root" ]; then
+  ORIG_USER=$(logname 2>/dev/null || true)
+fi
+# For SSH sessions, try to get user from SSH_CLIENT or who command
+if [ -z "$ORIG_USER" ] || [ "$ORIG_USER" = "root" ]; then
+  # Try to get the user who owns the SSH session
+  ORIG_USER=$(who am i 2>/dev/null | awk '{print $1}' || true)
+fi
+# Last resort: try to get the first non-root user from who
+if [ -z "$ORIG_USER" ] || [ "$ORIG_USER" = "root" ]; then
+  ORIG_USER=$(who 2>/dev/null | awk 'NR==1 {print $1}' | grep -v root || true)
+fi
+
+if [ -n "$ORIG_USER" ] && [ "$ORIG_USER" != "root" ] && [ "$(id -u)" = "0" ]; then
+  chown "$ORIG_USER":"$ORIG_USER" "$file" 2>/dev/null || true
 fi
 
 echo -e "Done!\n\nResults located at $(realpath $file)\n"

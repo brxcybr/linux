@@ -2561,9 +2561,27 @@ def db_connect(db_path: Path) -> sqlite3.Connection:
 
 
 def db_init(conn: sqlite3.Connection, schema_path: Path) -> None:
+    # #region agent log
+    import json
+    with open('/Users/blane/Library/CloudStorage/OneDrive-WestPoint/Documents/ACI/Topics/WIRE/.cursor/debug.log', 'a') as f:
+        f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"ingest-baselines.py:2563","message":"db_init entry","data":{"schema_path":str(schema_path),"schema_exists":schema_path.exists()},"timestamp":int(__import__('time').time()*1000)})+"\n")
+    # #endregion
     schema_sql = schema_path.read_text(encoding="utf-8")
+    # #region agent log
+    with open('/Users/blane/Library/CloudStorage/OneDrive-WestPoint/Documents/ACI/Topics/WIRE/.cursor/debug.log', 'a') as f:
+        f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"ingest-baselines.py:2566","message":"schema loaded","data":{"schema_length":len(schema_sql),"has_auth_log_stats":'run_auth_log_stats' in schema_sql,"has_source_column":'source TEXT NOT NULL' in schema_sql or 'source,' in schema_sql},"timestamp":int(__import__('time').time()*1000)})+"\n")
+    # #endregion
     conn.executescript(schema_sql)
     conn.commit()
+    # #region agent log
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_auth_log_stats')").fetchall()]
+        with open('/Users/blane/Library/CloudStorage/OneDrive-WestPoint/Documents/ACI/Topics/WIRE/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"ingest-baselines.py:2572","message":"table columns after init","data":{"columns":cols,"has_source":"source" in cols},"timestamp":int(__import__('time').time()*1000)})+"\n")
+    except Exception as e:
+        with open('/Users/blane/Library/CloudStorage/OneDrive-WestPoint/Documents/ACI/Topics/WIRE/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"ingest-baselines.py:2575","message":"table check error","data":{"error":str(e)},"timestamp":int(__import__('time').time()*1000)})+"\n")
+    # #endregion
 
 
 def db_migrate(conn: sqlite3.Connection) -> None:
@@ -2571,16 +2589,109 @@ def db_migrate(conn: sqlite3.Connection) -> None:
     Lightweight migrations for existing DBs.
     (SQLite can't drop constraints in-place; we rebuild affected tables.)
     """
+    # #region agent log
+    import json
+    # #endregion
+    
+    # Migration: run_auth_log_stats table schema update
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_auth_log_stats')").fetchall()]
+        # #region agent log
+        with open('/Users/blane/Library/CloudStorage/OneDrive-WestPoint/Documents/ACI/Topics/WIRE/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"D","location":"ingest-baselines.py:2578","message":"checking run_auth_log_stats for migration","data":{"columns":cols,"needs_migration":"source" not in cols},"timestamp":int(__import__('time').time()*1000)})+"\n")
+        # #endregion
+        if "source" not in cols:
+            # Old schema detected - need to recreate table
+            # #region agent log
+            with open('/Users/blane/Library/CloudStorage/OneDrive-WestPoint/Documents/ACI/Topics/WIRE/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"D","location":"ingest-baselines.py:2582","message":"migrating run_auth_log_stats","data":{"old_columns":cols},"timestamp":int(__import__('time').time()*1000)})+"\n")
+            # #endregion
+            # Backup existing data (if any)
+            existing_data = conn.execute("SELECT * FROM run_auth_log_stats").fetchall()
+            # Drop old table
+            conn.execute("DROP TABLE IF EXISTS run_auth_log_stats")
+            # Recreate with new schema
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS run_auth_log_stats (
+                  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                  source TEXT NOT NULL,  -- journalctl_ssh | auth_log | secure
+                  failed_password_count INTEGER NOT NULL DEFAULT 0,
+                  invalid_user_count INTEGER NOT NULL DEFAULT 0,
+                  accepted_password_count INTEGER NOT NULL DEFAULT 0,
+                  accepted_publickey_count INTEGER NOT NULL DEFAULT 0,
+                  sudo_count INTEGER NOT NULL DEFAULT 0,
+                  error_count INTEGER NOT NULL DEFAULT 0,
+                  raw_line_count INTEGER NOT NULL DEFAULT 0,
+                  PRIMARY KEY (run_id, source)
+                )
+            """)
+            # Note: We don't migrate old data as the schema is incompatible
+            # #region agent log
+            with open('/Users/blane/Library/CloudStorage/OneDrive-WestPoint/Documents/ACI/Topics/WIRE/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"D","location":"ingest-baselines.py:2605","message":"migration complete","data":{"old_rows_dropped":len(existing_data)},"timestamp":int(__import__('time').time()*1000)})+"\n")
+            # #endregion
+            conn.commit()
+    except sqlite3.OperationalError:
+        # Table doesn't exist yet, will be created by schema
+        # #region agent log
+        with open('/Users/blane/Library/CloudStorage/OneDrive-WestPoint/Documents/ACI/Topics/WIRE/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"D","location":"ingest-baselines.py:2610","message":"table does not exist yet","data":{},"timestamp":int(__import__('time').time()*1000)})+"\n")
+        # #endregion
+        pass
+    
+    # Migration: run_ssh_host_keys table schema update
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_ssh_host_keys')").fetchall()]
+        if "fingerprint" not in cols or "raw_line" not in cols:
+            # Old schema detected
+            existing_data = conn.execute("SELECT * FROM run_ssh_host_keys").fetchall()
+            conn.execute("DROP TABLE IF EXISTS run_ssh_host_keys")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS run_ssh_host_keys (
+                  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                  bits INTEGER,
+                  fingerprint TEXT NOT NULL,
+                  key_file TEXT,
+                  key_type TEXT NOT NULL,
+                  raw_line TEXT NOT NULL,
+                  PRIMARY KEY (run_id, key_type, fingerprint)
+                )
+            """)
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    
+    # Migration: run_systemd_timers table schema update
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_systemd_timers')").fetchall()]
+        if "next" not in cols or "left" not in cols or "raw_line" not in cols:
+            # Old schema detected
+            existing_data = conn.execute("SELECT * FROM run_systemd_timers").fetchall()
+            conn.execute("DROP TABLE IF EXISTS run_systemd_timers")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS run_systemd_timers (
+                  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                  next TEXT,
+                  left TEXT,
+                  last TEXT,
+                  passed TEXT,
+                  unit TEXT NOT NULL,
+                  activates TEXT,
+                  raw_line TEXT NOT NULL,
+                  PRIMARY KEY (run_id, unit)
+                )
+            """)
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    
     # Migrate asset_identifiers to v2:
     # - add identifier_id primary key
     # - remove global uniqueness on (id_type,id_value) to tolerate cloned identifiers
     try:
         cols = [r[1] for r in conn.execute("PRAGMA table_info('asset_identifiers')").fetchall()]
-    except sqlite3.OperationalError:
-        return
-
-    if "identifier_id" not in cols:
-        conn.executescript(
+        if "identifier_id" not in cols:
+            conn.executescript(
             """
             BEGIN;
             ALTER TABLE asset_identifiers RENAME TO asset_identifiers_old;
@@ -2600,8 +2711,11 @@ def db_migrate(conn: sqlite3.Connection) -> None:
             DROP TABLE asset_identifiers_old;
             COMMIT;
             """
-        )
-        conn.commit()
+            )
+            conn.commit()
+    except sqlite3.OperationalError:
+        # Table doesn't exist yet, will be created by schema
+        pass
 
 
 _CATALOG_OVERRIDES: dict[str, dict[str, str]] = {
@@ -4687,6 +4801,16 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
         out = cmd_by_tag.get(tag)
         if out:
             c = _auth_log_counts(out)
+            # #region agent log
+            import json
+            try:
+                cols = [r[1] for r in conn.execute("PRAGMA table_info('run_auth_log_stats')").fetchall()]
+                with open('/Users/blane/Library/CloudStorage/OneDrive-WestPoint/Documents/ACI/Topics/WIRE/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"C","location":"ingest-baselines.py:4690","message":"before INSERT run_auth_log_stats","data":{"columns":cols,"has_source":"source" in cols,"source_value":src},"timestamp":int(__import__('time').time()*1000)})+"\n")
+            except Exception as e:
+                with open('/Users/blane/Library/CloudStorage/OneDrive-WestPoint/Documents/ACI/Topics/WIRE/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"C","location":"ingest-baselines.py:4693","message":"table check error before INSERT","data":{"error":str(e)},"timestamp":int(__import__('time').time()*1000)})+"\n")
+            # #endregion
             conn.execute(
                 """
                 INSERT OR REPLACE INTO run_auth_log_stats(
@@ -5024,7 +5148,21 @@ def main(argv: Optional[list[str]] = None) -> int:
             shm.unlink()
 
     conn = db_connect(args.db)
+    # #region agent log
+    import json
+    with open('/Users/blane/Library/CloudStorage/OneDrive-WestPoint/Documents/ACI/Topics/WIRE/.cursor/debug.log', 'a') as f:
+        f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"B","location":"ingest-baselines.py:5026","message":"db connection","data":{"db_path":str(args.db),"db_exists":args.db.exists(),"schema_path":str(args.schema)},"timestamp":int(__import__('time').time()*1000)})+"\n")
+    # #endregion
     db_init(conn, args.schema)
+    # #region agent log
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_auth_log_stats')").fetchall()]
+        with open('/Users/blane/Library/CloudStorage/OneDrive-WestPoint/Documents/ACI/Topics/WIRE/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"B","location":"ingest-baselines.py:5030","message":"table columns after db_init","data":{"columns":cols,"has_source":"source" in cols},"timestamp":int(__import__('time').time()*1000)})+"\n")
+    except Exception as e:
+        with open('/Users/blane/Library/CloudStorage/OneDrive-WestPoint/Documents/ACI/Topics/WIRE/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"B","location":"ingest-baselines.py:5033","message":"table check error","data":{"error":str(e)},"timestamp":int(__import__('time').time()*1000)})+"\n")
+    # #endregion
     db_migrate(conn)
     if not args.skip_host_csv and args.host_csv.exists():
         upsert_assets_from_csv(conn, args.host_csv)
