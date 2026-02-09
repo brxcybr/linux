@@ -237,20 +237,18 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
                 ls.pid,
                 p.uid,
                 p.cmd
-            FROM run_listening_sockets ls
-            JOIN runs r ON r.run_id = ls.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
+            FROM v_asset_current ac
+            JOIN run_listening_sockets ls ON ls.run_id = ac.last_run_id
             LEFT JOIN run_processes p ON p.pid = ls.pid AND p.run_id = ls.run_id
-            WHERE a.hostname = ?
+            WHERE ac.hostname = ?
             ORDER BY ls.local_port
         """, (hostname,)).fetchall()
 
         firewall_rules = conn.execute("""
             SELECT source, rule
-            FROM run_firewall_rules fr
-            JOIN runs r ON r.run_id = fr.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
-            WHERE a.hostname = ?
+            FROM v_asset_current ac
+            JOIN run_firewall_rules fr ON fr.run_id = ac.last_run_id
+            WHERE ac.hostname = ?
         """, (hostname,)).fetchall()
 
         if ports_data:
@@ -276,21 +274,19 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
                         uid_num = int(uid_str)
                         user_row = conn.execute("""
                             SELECT u.username, u.uid, g.groupname
-                            FROM run_users u
+                            FROM v_asset_current ac
+                            JOIN run_users u ON u.run_id = ac.last_run_id
                             LEFT JOIN run_groups g ON g.run_id = u.run_id AND g.gid = u.gid
-                            JOIN runs r ON r.run_id = u.run_id
-                            JOIN assets a ON a.asset_id = r.asset_id
-                            WHERE a.hostname = ? AND u.uid = ?
+                            WHERE ac.hostname = ? AND u.uid = ?
                             LIMIT 1
                         """, (hostname, uid_num)).fetchone()
                     else:
                         user_row = conn.execute("""
                             SELECT u.username, u.uid, g.groupname
-                            FROM run_users u
+                            FROM v_asset_current ac
+                            JOIN run_users u ON u.run_id = ac.last_run_id
                             LEFT JOIN run_groups g ON g.run_id = u.run_id AND g.gid = u.gid
-                            JOIN runs r ON r.run_id = u.run_id
-                            JOIN assets a ON a.asset_id = r.asset_id
-                            WHERE a.hostname = ? AND u.username = ?
+                            WHERE ac.hostname = ? AND u.username = ?
                             LIMIT 1
                         """, (hostname, uid_str)).fetchone()
                     if user_row:
@@ -314,10 +310,9 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
                 if base:
                     pkg_rows = conn.execute("""
                         SELECT name, version
-                        FROM run_packages p
-                        JOIN runs r ON r.run_id = p.run_id
-                        JOIN assets a ON a.asset_id = r.asset_id
-                        WHERE a.hostname = ? AND (p.name LIKE ? OR p.name LIKE ?)
+                        FROM v_asset_current ac
+                        JOIN run_packages p ON p.run_id = ac.last_run_id
+                        WHERE ac.hostname = ? AND (p.name LIKE ? OR p.name LIKE ?)
                         LIMIT 3
                     """, (hostname, f"{base}%", f"%{base}%")).fetchall()
                     if pkg_rows:
@@ -355,10 +350,9 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
         findings_section = []
         host_findings = conn.execute("""
             SELECT severity, category, title, details
-            FROM findings f
-            JOIN runs r ON r.run_id = f.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
-            WHERE a.hostname = ?
+            FROM v_asset_current ac
+            JOIN findings f ON f.run_id = ac.last_run_id
+            WHERE ac.hostname = ?
             ORDER BY CASE severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END
         """, (hostname,)).fetchall()
 
@@ -376,14 +370,13 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
         # User and Permission Analysis
         users_section = []
 
-        # Service accounts with shells
+        # Service accounts with shells (latest run only)
         service_accounts = conn.execute("""
             SELECT u.username, u.shell, u.uid, GROUP_CONCAT(gm.groupname) as groups
-            FROM run_users u
-            JOIN runs r ON r.run_id = u.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
+            FROM v_asset_current ac
+            JOIN run_users u ON u.run_id = ac.last_run_id
             LEFT JOIN run_group_members gm ON gm.run_id = u.run_id AND gm.member_username = u.username AND gm.source = 'getent'
-            WHERE a.hostname = ? AND u.shell LIKE '%sh' AND u.uid < 1000 AND u.username NOT IN ('root', 'ubuntu', 'ec2-user')
+            WHERE ac.hostname = ? AND u.shell LIKE '%sh' AND u.uid < 1000 AND u.username NOT IN ('root', 'ubuntu', 'ec2-user')
             GROUP BY u.username, u.shell, u.uid
         """, (hostname,)).fetchall()
 
@@ -395,13 +388,12 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
                     users_section.append(f"    Groups: {groups}")
                 users_section.append("    🔒 RECOMMENDATION: Remove shell access or change to /usr/sbin/nologin")
 
-        # Privileged users
+        # Privileged users (latest run only)
         privileged_users = conn.execute("""
             SELECT gm.member_username, GROUP_CONCAT(DISTINCT gm.groupname) as groups, COUNT(*) as group_count
-            FROM run_group_members gm
-            JOIN runs r ON r.run_id = gm.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
-            WHERE a.hostname = ? AND gm.groupname IN ('sudo', 'wheel', 'adm', 'admin', 'root')
+            FROM v_asset_current ac
+            JOIN run_group_members gm ON gm.run_id = ac.last_run_id
+            WHERE ac.hostname = ? AND gm.groupname IN ('sudo', 'wheel', 'adm', 'admin', 'root')
             GROUP BY gm.member_username
             HAVING group_count > 0
         """, (hostname,)).fetchall()
@@ -411,15 +403,14 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
             for username, groups, count in privileged_users:
                 users_section.append(f"  {username}: {groups}")
 
-        # Users who have never logged in but have SSH keys
+        # Users who have never logged in but have SSH keys (latest run only)
         unused_accounts = conn.execute("""
             SELECT u.username, COUNT(k.key_fingerprint_sha256) as key_count
-            FROM run_users u
-            JOIN runs r ON r.run_id = u.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
+            FROM v_asset_current ac
+            JOIN run_users u ON u.run_id = ac.last_run_id
             LEFT JOIN run_lastlog ll ON ll.run_id = u.run_id AND ll.username = u.username
             LEFT JOIN run_ssh_authorized_keys k ON k.run_id = u.run_id AND k.username = u.username
-            WHERE a.hostname = ?
+            WHERE ac.hostname = ?
               AND u.shell LIKE '%sh'
               AND (ll.latest IS NULL OR ll.latest = 'Never logged in')
             GROUP BY u.username
@@ -454,21 +445,20 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
             for cmd, host_count in rare_processes:
                 node_specific_section.append(f"  {cmd} (only on {host_count} node{'s' if host_count > 1 else ''})")
 
-        # Rare packages (unique to this node or one other)
+        # Rare packages (unique to this node or one other) (latest run only)
         rare_packages = conn.execute("""
             WITH pkg_counts AS (
-                SELECT p.name, COUNT(DISTINCT r.asset_id) as host_count
-                FROM run_packages p
-                JOIN runs r ON r.run_id = p.run_id
+                SELECT p.name, COUNT(DISTINCT ac.asset_id) as host_count
+                FROM v_asset_current ac
+                JOIN run_packages p ON p.run_id = ac.last_run_id
                 GROUP BY p.name
                 HAVING host_count <= 2
             )
             SELECT p.name, p.version, pc.host_count
-            FROM run_packages p
-            JOIN runs r ON r.run_id = p.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
+            FROM v_asset_current ac
+            JOIN run_packages p ON p.run_id = ac.last_run_id
             JOIN pkg_counts pc ON pc.name = p.name
-            WHERE a.hostname = ?
+            WHERE ac.hostname = ?
             ORDER BY pc.host_count, p.name
             LIMIT 15
         """, (hostname,)).fetchall()
@@ -497,13 +487,12 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
                     f"  {mod['module']}{desc}{lic} (only on {mod['host_count']} node{'s' if mod['host_count'] > 1 else ''})"
                 )
 
-        # USB devices (list all; servers should typically be USB-free)
+        # USB devices (list all; servers should typically be USB-free) (latest run only)
         usb_devices = conn.execute("""
             SELECT vendor_id, product_id, vendor_name, product_name, serial_number, bus_number, device_number
-            FROM run_usb_devices d
-            JOIN runs r ON r.run_id = d.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
-            WHERE a.hostname = ?
+            FROM v_asset_current ac
+            JOIN run_usb_devices d ON d.run_id = ac.last_run_id
+            WHERE ac.hostname = ?
             ORDER BY bus_number, device_number
         """, (hostname,)).fetchall()
 
@@ -544,19 +533,17 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
                 AVG(CASE WHEN p.status_code = 'P' THEN 1 ELSE 0 END) as pwd_enabled_pct,
                 COUNT(*) as total_accounts,
                 SUM(CASE WHEN p.status_code = 'L' THEN 1 ELSE 0 END) as locked_accounts
-            FROM run_passwd_status p
-            JOIN runs r ON r.run_id = p.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
-            WHERE a.hostname = ?
+            FROM v_asset_current ac
+            JOIN run_passwd_status p ON p.run_id = ac.last_run_id
+            WHERE ac.hostname = ?
         """, (hostname,)).fetchone()
 
         if host_passwd_complexity and host_passwd_complexity[1] > 0:
             pw_accounts = conn.execute("""
                 SELECT p.username
-                FROM run_passwd_status p
-                JOIN runs r ON r.run_id = p.run_id
-                JOIN assets a ON a.asset_id = r.asset_id
-                WHERE a.hostname = ? AND p.status_code = 'P'
+                FROM v_asset_current ac
+                JOIN run_passwd_status p ON p.run_id = ac.last_run_id
+                WHERE ac.hostname = ? AND p.status_code = 'P'
                 ORDER BY p.username
             """, (hostname,)).fetchall()
             pw_names = [row["username"] for row in pw_accounts]
@@ -570,15 +557,14 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
         # Audit configuration
         audit_config = conn.execute("""
             SELECT ar.rule_count, ap.audit_enabled, ap.audit_immutable
-            FROM (
+            FROM v_asset_current ac
+            JOIN (
                 SELECT COUNT(*) as rule_count, run_id
                 FROM run_audit_rules
                 GROUP BY run_id
-            ) ar
-            JOIN run_audit_posture ap ON ap.run_id = ar.run_id
-            JOIN runs r ON r.run_id = ap.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
-            WHERE a.hostname = ?
+            ) ar ON ar.run_id = ac.last_run_id
+            JOIN run_audit_posture ap ON ap.run_id = ac.last_run_id
+            WHERE ac.hostname = ?
         """, (hostname,)).fetchone()
 
         if audit_config:
@@ -591,10 +577,9 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
         # Firewall configuration
         firewall_config = conn.execute("""
             SELECT source, COUNT(*) as rule_count
-            FROM run_firewall_rules
-            JOIN runs r ON r.run_id = run_firewall_rules.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
-            WHERE a.hostname = ?
+            FROM v_asset_current ac
+            JOIN run_firewall_rules fr ON fr.run_id = ac.last_run_id
+            WHERE ac.hostname = ?
             GROUP BY source
         """, (hostname,)).fetchall()
 
@@ -604,10 +589,9 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
                 config_section.append(f"  {source}: {count} rules")
             custom_rules = conn.execute("""
                 SELECT source, rule
-                FROM run_firewall_rules fr
-                JOIN runs r ON r.run_id = fr.run_id
-                JOIN assets a ON a.asset_id = r.asset_id
-                WHERE a.hostname = ? AND (fr.rule LIKE '%ACCEPT%' OR fr.rule LIKE '%ALLOW%')
+                FROM v_asset_current ac
+                JOIN run_firewall_rules fr ON fr.run_id = ac.last_run_id
+                WHERE ac.hostname = ? AND (fr.rule LIKE '%ACCEPT%' OR fr.rule LIKE '%ALLOW%')
                 LIMIT 5
             """, (hostname,)).fetchall()
             if custom_rules:
@@ -624,10 +608,9 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
         logging_section = []
         log_services = conn.execute("""
             SELECT unit, load, active, sub
-            FROM run_services_systemctl s
-            JOIN runs r ON r.run_id = s.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
-            WHERE a.hostname = ?
+            FROM v_asset_current ac
+            JOIN run_services_systemctl s ON s.run_id = ac.last_run_id
+            WHERE ac.hostname = ?
               AND s.unit IN ('rsyslog.service', 'systemd-journald.service')
             ORDER BY s.unit
         """, (hostname,)).fetchall()
@@ -638,18 +621,16 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
 
         rsyslog_conf = conn.execute("""
             SELECT output_text
-            FROM run_commands c
-            JOIN runs r ON r.run_id = c.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
-            WHERE a.hostname = ? AND c.command LIKE '%rsyslog.conf%'
+            FROM v_asset_current ac
+            JOIN run_commands c ON c.run_id = ac.last_run_id
+            WHERE ac.hostname = ? AND c.command LIKE '%rsyslog.conf%'
             LIMIT 1
         """, (hostname,)).fetchone()
         journald_conf = conn.execute("""
             SELECT output_text
-            FROM run_commands c
-            JOIN runs r ON r.run_id = c.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
-            WHERE a.hostname = ? AND c.command LIKE '%journald.conf%'
+            FROM v_asset_current ac
+            JOIN run_commands c ON c.run_id = ac.last_run_id
+            WHERE ac.hostname = ? AND c.command LIKE '%journald.conf%'
             LIMIT 1
         """, (hostname,)).fetchone()
 
@@ -658,21 +639,25 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
             text = rsyslog_conf["output_text"]
             targets.extend(re.findall(r"@@([A-Za-z0-9._-]+)", text))
             targets.extend(re.findall(r"@([A-Za-z0-9._-]+)", text))
-            targets.extend(re.findall(r"target\\s*=\\s*\"([^\"]+)\"", text))
+            targets.extend(re.findall(r"target\s*=\s*\"([^\"]+)\"", text))
         if journald_conf and journald_conf["output_text"]:
             text = journald_conf["output_text"]
-            targets.extend(re.findall(r"^\\s*ForwardToSyslog\\s*=\\s*(\\S+)", text, flags=re.MULTILINE))
-            targets.extend(re.findall(r"^\\s*ForwardToConsole\\s*=\\s*(\\S+)", text, flags=re.MULTILINE))
-            targets.extend(re.findall(r"^\\s*ForwardToWall\\s*=\\s*(\\S+)", text, flags=re.MULTILINE))
+            targets.extend(re.findall(r"^\s*ForwardToSyslog\s*=\s*(\S+)", text, flags=re.MULTILINE))
+            targets.extend(re.findall(r"^\s*ForwardToConsole\s*=\s*(\S+)", text, flags=re.MULTILINE))
+            targets.extend(re.findall(r"^\s*ForwardToWall\s*=\s*(\S+)", text, flags=re.MULTILINE))
 
         targets = [t for t in [t.strip() for t in targets] if t]
+        has_rsyslog = bool(rsyslog_conf and (rsyslog_conf["output_text"] or "").strip())
+        has_journald = bool(journald_conf and (journald_conf["output_text"] or "").strip())
         if targets:
             logging_section.append("Remote logging targets detected:")
             for t in sorted(set(targets)):
                 logging_section.append(f"  {t}")
+        elif has_rsyslog or has_journald:
+            logging_section.append("Remote logging targets: None found in collected rsyslog/journald config")
         else:
-            logging_section.append("Remote logging targets: Not detected in collected config")
-            logging_section.append("  (Consider capturing /etc/rsyslog.conf and /etc/systemd/journald.conf if not already collected)")
+            logging_section.append("Remote logging targets: Not detected (rsyslog.conf and journald.conf not in baseline)")
+            logging_section.append("  (Consider adding cat /etc/rsyslog.conf and cat /etc/systemd/journald.conf to baseline)")
 
         add_subsection("LOGGING CONFIGURATION", logging_section)
 
@@ -680,10 +665,9 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
         routing_section = []
         routes = conn.execute("""
             SELECT destination, gateway, iface, raw_line
-            FROM run_routes rr
-            JOIN runs r ON r.run_id = rr.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
-            WHERE a.hostname = ? AND destination NOT IN ('default', '0.0.0.0', '::/0')
+            FROM v_asset_current ac
+            JOIN run_routes rr ON rr.run_id = ac.last_run_id
+            WHERE ac.hostname = ? AND destination NOT IN ('default', '0.0.0.0', '::/0')
             LIMIT 10
         """, (hostname,)).fetchall()
         if routes:
@@ -708,12 +692,11 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
                 u.home,
                 u.shell,
                 g.groupname
-            FROM run_lastlog ll
-            JOIN runs r ON r.run_id = ll.run_id
-            JOIN assets a ON a.asset_id = r.asset_id
+            FROM v_asset_current ac
+            JOIN run_lastlog ll ON ll.run_id = ac.last_run_id
             LEFT JOIN run_users u ON u.run_id = ll.run_id AND u.username = ll.username
             LEFT JOIN run_groups g ON g.run_id = ll.run_id AND g.gid = u.gid
-            WHERE a.hostname = ?
+            WHERE ac.hostname = ?
               AND ll.latest IS NOT NULL
               AND ll.latest NOT LIKE '%Never%'
             ORDER BY ll.latest DESC
@@ -741,13 +724,12 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
 
     # Active accounts by node (lastlog)
     active_by_node = conn.execute("""
-        SELECT a.hostname, ll.username, ll.latest
-        FROM run_lastlog ll
-        JOIN runs r ON r.run_id = ll.run_id
-        JOIN assets a ON a.asset_id = r.asset_id
+        SELECT ac.hostname, ll.username, ll.latest
+        FROM v_asset_current ac
+        JOIN run_lastlog ll ON ll.run_id = ac.last_run_id
         WHERE ll.latest IS NOT NULL
           AND ll.latest NOT LIKE '%Never%'
-        ORDER BY a.hostname, ll.latest DESC
+        ORDER BY ac.hostname, ll.latest DESC
     """).fetchall()
     if active_by_node:
         comparison_section.append("Active accounts by node (lastlog):")
@@ -768,12 +750,11 @@ def generate_security_posture_report(db_path: Path, output_file: Path, report_ti
 
     # Password policy variance (accounts with passwords enabled)
     pw_by_host = conn.execute("""
-        SELECT a.hostname, p.username
-        FROM run_passwd_status p
-        JOIN runs r ON r.run_id = p.run_id
-        JOIN assets a ON a.asset_id = r.asset_id
+        SELECT ac.hostname, p.username
+        FROM v_asset_current ac
+        JOIN run_passwd_status p ON p.run_id = ac.last_run_id
         WHERE p.status_code = 'P'
-        ORDER BY a.hostname, p.username
+        ORDER BY ac.hostname, p.username
     """).fetchall()
     if pw_by_host:
         comparison_section.append("\nAccounts with passwords enabled by node:")

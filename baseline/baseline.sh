@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Linux Baseline v2.0.2
-# Author: brxcybr
+# Author: brx
 # Created: 24 October 2019
-# Updated: 23 January 2026
+# Updated: 05 February 2026
 #
 # This tool:
 # - Collects baseline data for Linux Hosts
@@ -437,6 +437,14 @@ echo >> $file && echo "===================================" >> $file
 echo "\$ timedatectl" >> $file && timedatectl >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ ntpstat" >> $file && ntpstat >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
+echo "\$ cat /etc/ntp.conf" >> $file && cat /etc/ntp.conf >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
+echo "\$ cat /etc/chrony.conf" >> $file && cat /etc/chrony.conf >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
+echo "\$ cat /etc/chrony/chrony.conf" >> $file && cat /etc/chrony/chrony.conf >> $file 2>&1
+echo >> $file && echo "===================================" >> $file
+echo "\$ cat /etc/systemd/timesyncd.conf" >> $file && cat /etc/systemd/timesyncd.conf >> $file 2>&1
 echo >> $file && echo "===================================" >> $file
 echo "\$ who -a" >> $file && who -a >> $file 2>&1
 echo >> $file && echo "===================================" >> $file

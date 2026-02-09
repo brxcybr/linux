@@ -30,98 +30,197 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ] ; then
   exit 0
 fi
 
-# File 1
-# Verify that filename was provided as a parameter and sets metadata (ip, date, time) to variable
-if [ ! -z "$1" ] ; then
-  echo -e "$# filename(s) provided.\nParsing first file..."
-  file1="$1"
-  ip1=$(echo ${file1##*/} | cut -d "_" -f1)
-  dtg1=$(echo ${file1##*/} | cut -d "_" -f2)
-  hms1=$(echo ${file1##*/} | cut -d "_" -f3 | cut -d "." -f1)
+# --- helpers (portable) ---
 
-  # Create output folder if it does not already exist
-  outdir1="./"$ip1"/"$dtg1"/"$hms1
-  if [ ! -d $outdir1 ] ; then
-    mkdir -p $outdir1
+msg() { printf '%s\n' "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+parse_meta_from_path() {
+  # outputs: ip dtg hms
+  local path="$1"
+  local base="${path##*/}"
+
+  local ip dtg hms_part hms
+  ip="${base%%_*}"
+  dtg="${base#*_}"; dtg="${dtg%%_*}"
+  hms_part="${base#*_*_}"
+  hms="${hms_part%%.*}"
+
+  [ -n "$ip" ]  || die "Could not parse ip from filename: $base"
+  [ -n "$dtg" ] || die "Could not parse dtg from filename: $base"
+  [ -n "$hms" ] || die "Could not parse hms from filename: $base"
+
+  printf '%s %s %s\n' "$ip" "$dtg" "$hms"
+}
+
+abs_path() {
+  local p="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$p"
+  else
+    local d b
+    d="$(cd "$(dirname "$p")" && pwd -P)" || return 1
+    b="$(basename "$p")"
+    printf '%s/%s\n' "$d" "$b"
   fi
-  
-  # Split files 
-  csplit --silent --prefix=$outdir1"/" --suffix-format="%02d.txt" $file1 '/^$ /' '{*}'
-  
-  # Give error if no filename is provided
-else
-  echo "No filename(s) provided."
-  exit 1
-fi
- 
-# File 2
-# Verify that filename was provided as a parameter and sets metadata (ip, date, time) to variable
-if [ ! -z "$2" ] ; then
-  echo "Parsing second file..."
+}
+
+md5_file() {
+  # portable: GNU coreutils (md5sum) or macOS (md5)
+  local f="$1"
+  if command -v md5sum >/dev/null 2>&1; then
+    md5sum "$f" | awk '{print $1}'
+  else
+    md5 -q "$f"
+  fi
+}
+
+timestamp_utc() {
+  date -u +%Y%m%d_%H%M%SZ
+}
+
+# Split by "$ " command header lines; preserve section headers for context
+split_by_command_headers() {
+  local infile="$1"
+  local outdir="$2"
+
+  [ -f "$infile" ] || die "Input file not found: $infile"
+  mkdir -p "$outdir" || die "Failed to create output dir: $outdir"
+  rm -f "$outdir"/*.txt 2>/dev/null || true
+
+  awk -v outdir="$outdir" '
+    function newfile() {
+      i++
+      fn = sprintf("%s/%02d.txt", outdir, i)
+      if (section != "") {
+        print section >> fn
+      }
+    }
+
+    BEGIN {
+      i = -1
+      fn = ""
+      section = ""
+    }
+
+    # Capture section headers like ************HOST INFO**************
+    /^\*{5,}/ {
+      section = $0
+      next
+    }
+
+    # New command starts at a line beginning with "$ "
+    /^\$ / {
+      newfile()
+      print $0 >> fn
+      next
+    }
+
+    # Write all other lines only after we have started first command chunk
+    {
+      if (i >= 0) {
+        print $0 >> fn
+      }
+    }
+  ' "$infile"
+}
+
+cmd_from_chunk() {
+  # First "$ ..." line in the chunk
+  sed -n 's/^\$ //p' "$1" | head -n 1
+}
+
+# --- File 1 required ---
+[ -n "${1:-}" ] || die "No filename(s) provided."
+file1="$1"
+read -r ip1 dtg1 hms1 < <(parse_meta_from_path "$file1")
+outdir1="./${ip1}/${dtg1}/${hms1}"
+msg "$# filename(s) provided."
+msg "Parsing first file..."
+split_by_command_headers "$file1" "$outdir1"
+
+# --- File 2 optional ---
+if [ -n "${2:-}" ]; then
   file2="$2"
-  ip2=$(echo ${file2##*/} | cut -d "_" -f1)
-  dtg2=$(echo ${file2##*/} | cut -d "_" -f2)
-  hms2=$(echo ${file2##*/} | cut -d "_" -f3 | cut -d "." -f1)
+  read -r ip2 dtg2 hms2 < <(parse_meta_from_path "$file2")
+  outdir2="./${ip2}/${dtg2}/${hms2}"
+  msg "Parsing second file..."
+  split_by_command_headers "$file2" "$outdir2"
 
-  # Creates folder if it does not already exist
-  outdir2="./"$ip2"/"$dtg2"/"$hms2
-  if [ ! -d $outdir2 ] ; then
-    mkdir -p $outdir2
+  if [ "$ip1" != "$ip2" ]; then
+    printf "Comparing two different IPs (%s vs %s). Proceed? [y/N] " "$ip1" "$ip2"
+    read -r reply
+    case "$reply" in
+      [Yy]*) msg "OK — results will go in ./${ip2}/" ;;
+      *) die "Aborted by user." ;;
+    esac
   fi
 
-  # Split files
-  csplit --silent --prefix=$outdir2"/" --suffix-format="%02d.txt" $file2 '/^$ /' '{*}'
-  
-  # Print notice if IP addresses are different and ask user if they would like to proceed
-  if [ $ip1 != $ip2 ]; then
-    read -p "You are requesting to compare results for two different IP addresses. Would you like to proceed? " -n 1 -r
-    echo ""
-    if [[ ! $REPLY =~ ^[Yy]$ ]] ; then
-      exit 1
-    else 
-      echo "Results will go in ./$ip2/ folder."
+  ts="$(timestamp_utc)"
+  outfile="./${ip2}/parse_baseline_${ts}.txt"
+  summary="./${ip2}/parse_summary_${ts}.txt"
+  mkdir -p "./${ip2}" || true
+
+  f1_size="$(ls -lah "$file1" | awk '{print $5}')"
+  f2_size="$(ls -lah "$file2" | awk '{print $5}')"
+
+  {
+    echo "BASELINE CHANGE SUMMARY"
+    echo "======================="
+    echo "Date created: $ts"
+    echo
+    printf "First file:  %s\n" "$(abs_path "$file1")"
+    printf "Second file: %s\n" "$(abs_path "$file2")"
+    echo
+    printf "File: 1\t\t\t\t\tFile: 2\n"
+    printf "Host: %s\t\t\tHost: %s\n" "$ip1" "$ip2"
+    printf "Date: %s\t\t\t\tDate: %s\n" "$dtg1" "$dtg2"
+    printf "Time: %s\t\t\t\tTime: %s\n" "$hms1" "$hms2"
+    printf "Size: %s\t\t\t\tSize: %s\n" "$f1_size" "$f2_size"
+    printf "MD5 : %s\tMD5 : %s\n" "$(md5_file "$file1")" "$(md5_file "$file2")"
+    echo
+    echo "Commands with changed output:"
+  } > "$summary"
+
+  : > "$outfile"
+
+  # Compare chunk-by-chunk (by filename index 00.txt, 01.txt, ...)
+  for a in "$outdir1"/*.txt; do
+    [ -e "$a" ] || break
+    b="$outdir2/$(basename "$a")"
+
+    if [ ! -f "$b" ]; then
+      cmd="$(cmd_from_chunk "$a")"
+      printf "  - %s (missing in file2)\n" "${cmd:-UNKNOWN}" >> "$summary"
+      {
+        echo
+        echo "==================================="
+        echo "MISSING IN FILE2: ${cmd:-UNKNOWN}"
+        echo "Chunk: $(basename "$a")"
+        echo "-----------------------------------"
+        cat "$a"
+      } >> "$outfile"
+      continue
     fi
-  fi
 
-  # Compare files and output differences to output filename
-  timestamp=`(date -u +%Y%m%d_%TZ)`
-  
-  outfile="./"$ip2"/parse_baseline_"$timestamp".txt"
-  summary="./"$ip2"/parse_summary_"$timestamp".txt"
-  files=`ls -A $outdir1"/"`
-  f1_size=$(ls -lah $file1 | awk -F " " {'print $5'})
-  f2_size=$(ls -lah $file2 | awk -F " " {'print $5'})
-  
-  # Setup summary file 
-  echo "BASELINE CHANGE SUMMARY" >> $summary
-  echo "=======================" >> $summary
-  echo "Date created: $timestamp" >> $summary
-  echo "" >> $summary
-  echo -e "First file:  $(realpath $file1)" >> $summary
-  echo -e "Second file: $(realpath $file2)" >> $summary
-  echo "" >> $summary
-  echo -e "File: 1\t\t\t\t\tFile: 2" >> $summary
-  echo -e "Host: $ip1\t\t\tHost: $ip2" >> $summary
-  echo -e "Date: $dtg1\t\t\t\tDate: $dtg2" >> $summary
-  echo -e "Time: $hms1\t\t\t\tDate: $hms2" >> $summary
-  echo -e "Size: $f1_size\t\t\t\tSize: $f2_size" >> $summary
-  echo -e "MD5 : $(md5sum $file1 | cut -d " " -f1)\tMD5 : $(md5sum $file2 | cut -d " " -f1)" >> $summary
-  echo "" >> $summary
-  echo "The output of the following commands have changed:" >> $summary
+    # Unified diff is portable and readable
+    if diffout="$(diff -u "$a" "$b" 2>/dev/null || true)" && [ -n "$diffout" ]; then
+      cmd="$(cmd_from_chunk "$a")"
+      printf "  - %s\n" "${cmd:-UNKNOWN}" >> "$summary"
+      {
+        echo
+        echo "==================================="
+        echo "COMMAND: ${cmd:-UNKNOWN}"
+        echo "CHUNK: $(basename "$a")"
+        echo "-----------------------------------"
+        echo "$diffout"
+      } >> "$outfile"
+    fi
+  done
 
-  # Generate output
-  for f in $files
-    do
-      if [[ $(diff $outdir1"/"$f $outdir2"/"$f) ]] ; then 
-	echo "" >> $outfile
-	echo "===================================" >> $outfile
-	head -1 $outdir1"/"$f >> $outfile
-	cmd=$(head -1 $outdir1"/"$f)
-	echo -e "$f\t${cmd#??}" >> $summary
-        diff -y --suppress-common-lines $outdir1"/"$f $outdir2"/"$f >> $outfile
-      fi;
-    done
+  msg "Wrote:"
+  msg "  $summary"
+  msg "  $outfile"
 fi
 
-echo "Done!"
-exit 0
+msg "Done!"

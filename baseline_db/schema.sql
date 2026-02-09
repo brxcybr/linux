@@ -119,6 +119,9 @@ CREATE TABLE IF NOT EXISTS run_hostinfo (
   machine_id TEXT,
   boot_id TEXT,
   operating_system TEXT,
+  os_name TEXT,       -- parsed distribution name (e.g. Ubuntu)
+  os_version TEXT,    -- parsed version (e.g. 22.04)
+  os_id TEXT,         -- distribution id (e.g. ubuntu)
   kernel TEXT,
   architecture TEXT,
   hardware_vendor TEXT,
@@ -135,6 +138,17 @@ CREATE TABLE IF NOT EXISTS run_timedate (
   system_clock_synchronized TEXT,
   ntp_service TEXT,
   rtc_in_local_tz TEXT
+);
+
+-- NTP/Chrony/timesyncd server configuration
+CREATE TABLE IF NOT EXISTS run_ntp_servers (
+  ntp_server_id INTEGER PRIMARY KEY,
+  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  server_type TEXT NOT NULL,  -- ntp | chrony | timesyncd
+  server_address TEXT NOT NULL,
+  options TEXT,  -- server options (e.g., "iburst", "prefer")
+  pool BOOLEAN DEFAULT 0,  -- true if server is a pool (e.g., pool.ntp.org)
+  UNIQUE(run_id, server_type, server_address)
 );
 
 -- Uptime snapshot from `uptime` (store as raw + best-effort parsed fields)
@@ -164,6 +178,7 @@ CREATE TABLE IF NOT EXISTS run_block_devices (
   run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   type TEXT,
+  parent_name TEXT,
   size_bytes INTEGER,
   rm INTEGER,
   ro INTEGER,
@@ -198,6 +213,28 @@ CREATE TABLE IF NOT EXISTS run_gpu_devices (
   UNIQUE(run_id, slot, class, device, kernel_driver_in_use)
 );
 
+-- Hardware device tree from `lshw -disable dmi` (one row per device node)
+CREATE TABLE IF NOT EXISTS run_lshw_devices (
+  lshw_device_id INTEGER PRIMARY KEY,
+  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  depth INTEGER NOT NULL,
+  class TEXT NOT NULL,
+  logical_name TEXT,
+  description TEXT,
+  product TEXT,
+  vendor TEXT,
+  physical_id TEXT,
+  bus_info TEXT,
+  slot TEXT,
+  size TEXT,
+  capacity TEXT,
+  serial TEXT,
+  version TEXT,
+  width_bits INTEGER,
+  clock_hz INTEGER,
+  raw_line TEXT
+);
+
 -- Privileged group membership from `getent group ...` (captures NSS/LDAP, not just /etc/group)
 CREATE TABLE IF NOT EXISTS run_priv_groups (
   run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
@@ -205,6 +242,7 @@ CREATE TABLE IF NOT EXISTS run_priv_groups (
   gid INTEGER,
   members_csv TEXT,
   source TEXT NOT NULL DEFAULT 'getent',
+  group_type TEXT,  -- service | user | rare (same classification as run_groups)
   PRIMARY KEY (run_id, source, groupname)
 );
 
@@ -251,6 +289,7 @@ CREATE TABLE IF NOT EXISTS run_groups (
   groupname TEXT NOT NULL,
   gid INTEGER,
   members_csv TEXT,
+  group_type TEXT,  -- service | user | rare (classification for drift/review)
   PRIMARY KEY (run_id, groupname)
 );
 
@@ -260,6 +299,7 @@ CREATE TABLE IF NOT EXISTS run_group_members (
   source TEXT NOT NULL,           -- etc_group | getent
   groupname TEXT NOT NULL,
   member_username TEXT NOT NULL,
+  member_uid INTEGER,             -- looked up from run_users when available
   PRIMARY KEY (run_id, source, groupname, member_username)
 );
 
@@ -336,6 +376,12 @@ CREATE TABLE IF NOT EXISTS run_last_events (
   UNIQUE(run_id, source, raw_line)
 );
 
+-- Reference table for TTY values (supports correlation across systems)
+CREATE TABLE IF NOT EXISTS ref_tty (
+  tty_value TEXT PRIMARY KEY,
+  tty_kind TEXT  -- ssh | pts | tty | console | serial | other
+);
+
 -- Enhanced failed login events (derived from btmp)
 CREATE TABLE IF NOT EXISTS run_failed_logins (
   failed_login_id INTEGER PRIMARY KEY,
@@ -343,6 +389,7 @@ CREATE TABLE IF NOT EXISTS run_failed_logins (
   username TEXT NOT NULL,
   remote_host TEXT,
   tty TEXT,
+  state_text TEXT,  -- e.g. still_logged_in, gone_no_logout, or session duration context
   attempt_time_utc TEXT,  -- normalized ISO UTC timestamp
   raw_start_text TEXT,
   raw_line TEXT NOT NULL,
@@ -463,6 +510,7 @@ CREATE TABLE IF NOT EXISTS run_usb_devices (
   device_class INTEGER,
   device_subclass INTEGER,
   device_protocol INTEGER,
+  device_class_label TEXT,  -- human-readable USB class (e.g. HID, Mass Storage, Hub)
   vendor_name TEXT,
   product_name TEXT,
   manufacturer TEXT,
@@ -513,6 +561,7 @@ CREATE TABLE IF NOT EXISTS run_ip_neigh (
   dev TEXT,
   lladdr TEXT,
   state TEXT,
+  ip_type TEXT,  -- loopback | link_local | private | public (classification)
   raw_line TEXT NOT NULL,
   UNIQUE(run_id, raw_line)
 );
@@ -529,6 +578,7 @@ CREATE TABLE IF NOT EXISTS run_routes (
   ref INTEGER,
   use INTEGER,
   iface TEXT,
+  dest_type TEXT,  -- default | host | link | network (classification)
   raw_line TEXT NOT NULL,
   UNIQUE(run_id, raw_line)
 );
@@ -565,8 +615,14 @@ CREATE TABLE IF NOT EXISTS run_processes (
   tty TEXT,
   stat TEXT,
   start TEXT,
+  start_normalized_utc TEXT,  -- Normalized to UTC based on system timezone
   time TEXT,
   cmd TEXT,
+  process_name TEXT,  -- Extracted executable name (basename)
+  process_path TEXT,  -- Full path to executable if available
+  process_arguments TEXT,  -- Arguments portion of cmd
+  parent_process_name TEXT,  -- Parent process executable name (from ppid lookup)
+  parent_process_path TEXT,  -- Parent process full path
   raw_line TEXT NOT NULL,
   UNIQUE(run_id, raw_line)
 );
@@ -617,6 +673,13 @@ CREATE TABLE IF NOT EXISTS run_kernel_module_insights (
   modules_with_unknown_signer TEXT     -- JSON array of modules with unknown signers
 );
 
+-- Reference: normalized permission (rwx string -> octal)
+CREATE TABLE IF NOT EXISTS ref_permissions (
+  perm_rwx TEXT PRIMARY KEY,
+  perm_octal INTEGER,
+  perm_kind TEXT   -- file | dir | link
+);
+
 -- File listings for persistence surfaces (ls -latR, recent binaries)
 CREATE TABLE IF NOT EXISTS run_file_listings (
   listing_id INTEGER PRIMARY KEY,
@@ -625,12 +688,17 @@ CREATE TABLE IF NOT EXISTS run_file_listings (
   directory TEXT,
   path TEXT,
   perms TEXT,
+  perm_octal INTEGER,           -- numeric mode (e.g. 755)
   owner TEXT,
   grp TEXT,
   size_bytes INTEGER,
   mtime_text TEXT,
+  mtime_normalized_utc TEXT,   -- ISO-8601 UTC when derivable from mtime_text + run timezone
   name TEXT,
+  filename TEXT,               -- basename / display name (without symlink target)
   file_type TEXT,
+  is_symlink INTEGER DEFAULT 0,
+  symlink_target TEXT,
   raw_line TEXT NOT NULL,
   UNIQUE(run_id, source, directory, raw_line)
 );
@@ -651,6 +719,7 @@ CREATE TABLE IF NOT EXISTS run_interfaces (
   mac_addr TEXT,
   state TEXT,
   mtu INTEGER,
+  iface_type TEXT,  -- loopback | physical | bridge | veth | docker | virtual | other
   PRIMARY KEY (run_id, ifname)
 );
 
@@ -660,7 +729,8 @@ CREATE TABLE IF NOT EXISTS run_interface_addrs (
   family TEXT NOT NULL,      -- inet / inet6
   address TEXT NOT NULL,
   prefixlen INTEGER,
-  scope TEXT,
+  scope TEXT,                -- from ip output: global, link, host, etc.; inferred if missing
+  addr_type TEXT,            -- loopback | link_local | private | public (classification)
   PRIMARY KEY (run_id, ifname, family, address)
 );
 
@@ -676,6 +746,7 @@ CREATE TABLE IF NOT EXISTS run_listening_sockets (
   peer_port INTEGER,
   process_name TEXT,
   pid INTEGER,
+  bind_scope TEXT,  -- loopback | all_interfaces | specific (security-relevant)
   raw_line TEXT,
   UNIQUE(run_id, proto, state, local_addr, local_port, peer_addr, peer_port, pid, process_name)
 );
@@ -688,6 +759,7 @@ CREATE TABLE IF NOT EXISTS run_services_systemctl (
   active TEXT,
   sub TEXT,
   description TEXT,
+  unit_type TEXT,  -- service | socket | timer | path | mount | etc. (from unit suffix)
   PRIMARY KEY (run_id, unit)
 );
 
@@ -704,11 +776,19 @@ CREATE TABLE IF NOT EXISTS run_packages (
   UNIQUE(run_id, source, name, version, arch, status)
 );
 
+-- Reference: firewall rule source / type
+CREATE TABLE IF NOT EXISTS ref_firewall_type (
+  source_tag TEXT PRIMARY KEY,
+  description TEXT
+);
+
 -- Firewall rules (store parsed rules and/or raw lines)
 CREATE TABLE IF NOT EXISTS run_firewall_rules (
   run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
   source TEXT NOT NULL,  -- iptables_s | iptables_list | ufw_raw | firewalld_zones
   rule TEXT NOT NULL,
+  chain TEXT,   -- parsed e.g. from iptables -A CHAIN
+  target TEXT,  -- parsed e.g. from -j TARGET
   PRIMARY KEY (run_id, source, rule)
 );
 
@@ -786,13 +866,28 @@ CREATE TABLE IF NOT EXISTS run_file_capabilities (
   PRIMARY KEY (run_id, path)
 );
 
--- Container runtime summary (docker/podman info)
+-- Container runtime summary (docker/podman info) – key/value summary
 CREATE TABLE IF NOT EXISTS run_container_summary (
   run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
   runtime TEXT NOT NULL,  -- docker | podman
   k TEXT NOT NULL,
   v TEXT,
   PRIMARY KEY (run_id, runtime, k)
+);
+
+-- Per-container rows from `docker ps -a` / `podman ps -a`
+CREATE TABLE IF NOT EXISTS run_containers (
+  container_row_id INTEGER PRIMARY KEY,
+  run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  runtime TEXT NOT NULL,  -- docker | podman
+  container_id TEXT,
+  image TEXT,
+  status TEXT,
+  names TEXT,
+  created_text TEXT,
+  ports_text TEXT,
+  raw_line TEXT,
+  UNIQUE(run_id, runtime, container_id)
 );
 
 -- SSH host keys (fingerprints from ssh-keygen -lf)
@@ -818,6 +913,7 @@ CREATE TABLE IF NOT EXISTS run_sshd_config_kv (
 CREATE TABLE IF NOT EXISTS run_sudoers_rules (
   run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
   rule_text TEXT NOT NULL,
+  rule_type TEXT,  -- Defaults | User_Host | Runas | Cmnd | other (first token / alias)
   PRIMARY KEY (run_id, rule_text)
 );
 
@@ -854,6 +950,7 @@ CREATE TABLE IF NOT EXISTS run_systemd_enabled_unit_files (
   unit_file TEXT NOT NULL,
   state TEXT,
   preset TEXT,
+  unit_type TEXT,  -- service | socket | timer | path | etc. (from unit_file suffix)
   PRIMARY KEY (run_id, unit_file)
 );
 
@@ -1000,6 +1097,133 @@ LEFT JOIN v_latest_runs lr ON lr.asset_id = a.asset_id
 LEFT JOIN run_hostinfo hi ON hi.run_id = lr.run_id
 LEFT JOIN run_timedate td ON td.run_id = lr.run_id
 LEFT JOIN run_memory mem ON mem.run_id = lr.run_id;
+
+-- Up-to-date host inventory from latest baseline run (replaces static host_inventory.csv).
+-- Fills all host_inventory columns from run_* tables; overlays classification/location from host_inventory when present.
+DROP VIEW IF EXISTS v_host_inventory_current;
+CREATE VIEW v_host_inventory_current AS
+SELECT
+  ac.hostname,
+  ac.domain,
+  ac.fqdn,
+  hi_inv.classification,
+  hi_inv.location,
+  dmi.manufacturer AS server_manufacturer,
+  dmi.product_name AS server_model_series,
+  dmi.version AS server_model_no,
+  cpu_lshw.vendor AS proc_manufacturer,
+  cpu_lshw.product AS proc_model_series,
+  cpu_lshw.product AS proc_model_no,
+  NULL AS proc_no_cores,
+  NULL AS proc_count,
+  gpu_agg.gpu_manufacturer,
+  gpu_agg.gpu_model_series,
+  gpu_agg.gpu_model_no,
+  COALESCE(gpu_agg.gpu_count, 0) AS gpu_count,
+  CAST(mem.mem_total_bytes AS REAL) / (1024.0*1024*1024) AS memory_capacity_gb,
+  COALESCE(storage.storage_hdd_no_drives, 0) AS storage_hdd_no_drives,
+  storage.storage_hdd_capacity_gb,
+  COALESCE(storage.storage_nvme_no_drives, 0) AS storage_nvme_no_drives,
+  storage.storage_nvme_capacity_gb AS storage_nvme_capabity_gb,
+  COALESCE(storage.storage_ssd_no_drives, 0) AS storage_ssd_no_drives,
+  storage.storage_ssd_capacity_gb AS storage_ssd_capabity_gb,
+  os.os_name,
+  os.os_version,
+  ac.architecture AS arch,
+  ac.primary_ipv4 AS primary_ip,
+  (
+    SELECT ia.ifname
+    FROM run_interface_addrs ia
+    WHERE ia.run_id = ac.last_run_id AND ia.family = 'inet' AND ia.address = ac.primary_ipv4
+    LIMIT 1
+  ) AS interface,
+  ac.primary_mac AS mac_addr
+FROM v_asset_current ac
+LEFT JOIN run_dmi_system dmi ON dmi.run_id = ac.last_run_id
+LEFT JOIN (
+  SELECT d.run_id, d.vendor, d.product
+  FROM run_lshw_devices d
+  WHERE d.class = 'cpu'
+  AND d.lshw_device_id = (SELECT MIN(d2.lshw_device_id) FROM run_lshw_devices d2 WHERE d2.run_id = d.run_id AND d2.class = 'cpu')
+) cpu_lshw ON cpu_lshw.run_id = ac.last_run_id
+LEFT JOIN run_memory mem ON mem.run_id = ac.last_run_id
+LEFT JOIN host_inventory hi_inv ON hi_inv.hostname = ac.hostname
+LEFT JOIN (
+  SELECT run_id,
+    MAX(CASE WHEN k = 'NAME' THEN v END) AS os_name,
+    MAX(CASE WHEN k = 'VERSION_ID' THEN v END) AS os_version
+  FROM run_os_release_kv
+  GROUP BY run_id
+) os ON os.run_id = ac.last_run_id
+LEFT JOIN (
+  SELECT run_id,
+    COUNT(*) AS gpu_count,
+    MAX(vendor) AS gpu_manufacturer,
+    MAX(description) AS gpu_model_series,
+    MAX(device) AS gpu_model_no
+  FROM run_gpu_devices
+  GROUP BY run_id
+) gpu_agg ON gpu_agg.run_id = ac.last_run_id
+LEFT JOIN (
+  SELECT run_id,
+    SUM(CASE WHEN type = 'disk' AND (name LIKE '%nvme%' OR name LIKE 'nvme%') THEN 1 ELSE 0 END) AS storage_nvme_no_drives,
+    SUM(CASE WHEN type = 'disk' AND (name LIKE '%nvme%' OR name LIKE 'nvme%') THEN COALESCE(size_bytes, 0) ELSE 0 END) / (1024.0*1024*1024) AS storage_nvme_capacity_gb,
+    SUM(CASE WHEN type = 'disk' AND (name NOT LIKE '%nvme%' AND name NOT LIKE 'nvme%') THEN 1 ELSE 0 END) AS storage_hdd_no_drives,
+    SUM(CASE WHEN type = 'disk' AND (name NOT LIKE '%nvme%' AND name NOT LIKE 'nvme%') THEN COALESCE(size_bytes, 0) ELSE 0 END) / (1024.0*1024*1024) AS storage_hdd_capacity_gb,
+    0 AS storage_ssd_no_drives,
+    NULL AS storage_ssd_capacity_gb
+  FROM run_block_devices
+  GROUP BY run_id
+) storage ON storage.run_id = ac.last_run_id;
+
+-- Previous (second-most-recent) run per asset, for run-to-run change detection.
+DROP VIEW IF EXISTS v_asset_previous_run;
+CREATE VIEW v_asset_previous_run AS
+SELECT
+  ac.asset_id,
+  ac.hostname,
+  ac.last_run_id,
+  ac.last_collected_at_utc,
+  (
+    SELECT r.run_id
+    FROM runs r
+    WHERE r.asset_id = ac.asset_id AND r.collected_at_utc < ac.last_collected_at_utc
+    ORDER BY r.collected_at_utc DESC
+    LIMIT 1
+  ) AS previous_run_id,
+  (
+    SELECT r.collected_at_utc
+    FROM runs r
+    WHERE r.asset_id = ac.asset_id AND r.collected_at_utc < ac.last_collected_at_utc
+    ORDER BY r.collected_at_utc DESC
+    LIMIT 1
+  ) AS previous_collected_at_utc
+FROM v_asset_current ac;
+
+-- Privileged group membership changes between latest and previous run (added/removed users).
+DROP VIEW IF EXISTS v_run_delta_privileged_members;
+CREATE VIEW v_run_delta_privileged_members AS
+SELECT ac.hostname, cur.groupname, cur.member_username, 'added' AS change_type,
+  apr.last_run_id, apr.previous_run_id, apr.last_collected_at_utc, apr.previous_collected_at_utc
+FROM v_asset_current ac
+JOIN v_asset_previous_run apr ON apr.asset_id = ac.asset_id AND apr.previous_run_id IS NOT NULL
+JOIN run_group_members cur ON cur.run_id = apr.last_run_id
+JOIN run_priv_groups pcur ON pcur.run_id = apr.last_run_id AND pcur.groupname = cur.groupname
+WHERE NOT EXISTS (
+  SELECT 1 FROM run_group_members prev
+  WHERE prev.run_id = apr.previous_run_id AND prev.groupname = cur.groupname AND prev.member_username = cur.member_username
+)
+UNION ALL
+SELECT ac.hostname, prev.groupname, prev.member_username, 'removed' AS change_type,
+  apr.last_run_id, apr.previous_run_id, apr.last_collected_at_utc, apr.previous_collected_at_utc
+FROM v_asset_current ac
+JOIN v_asset_previous_run apr ON apr.asset_id = ac.asset_id AND apr.previous_run_id IS NOT NULL
+JOIN run_group_members prev ON prev.run_id = apr.previous_run_id
+JOIN run_priv_groups pprev ON pprev.run_id = apr.previous_run_id AND pprev.groupname = prev.groupname
+WHERE NOT EXISTS (
+  SELECT 1 FROM run_group_members cur
+  WHERE cur.run_id = apr.last_run_id AND cur.groupname = prev.groupname AND cur.member_username = prev.member_username
+);
 
 -- Failed logins in last 30 days by host
 DROP VIEW IF EXISTS v_failed_logins_recent;
@@ -1195,15 +1419,16 @@ ORDER BY ac.hostname, m.module;
 -- =========================
 
 -- Processes that appear on very few hosts (potential unique/custom software)
+-- Uses only latest run per asset for accurate fleet-wide analysis
 DROP VIEW IF EXISTS v_rare_processes;
 CREATE VIEW v_rare_processes AS
 WITH process_counts AS (
   SELECT
     p.cmd,
-    COUNT(DISTINCT r.asset_id) as host_count,
+    COUNT(DISTINCT ac.asset_id) as host_count,
     COUNT(*) as total_instances
-  FROM run_processes p
-  JOIN runs r ON r.run_id = p.run_id
+  FROM v_asset_current ac
+  JOIN run_processes p ON p.run_id = ac.last_run_id
   WHERE p.cmd NOT LIKE '/usr/bin/%'  -- Exclude common system binaries
     AND p.cmd NOT LIKE '/bin/%'
     AND p.cmd NOT LIKE '/sbin/%'
@@ -1221,12 +1446,12 @@ SELECT
   p.uid,
   p.ppid
 FROM process_counts pc
-JOIN run_processes p ON p.cmd = pc.cmd
-JOIN runs r ON r.run_id = p.run_id
-JOIN v_asset_current ac ON ac.asset_id = r.asset_id
+JOIN v_asset_current ac ON ac.last_run_id IS NOT NULL
+JOIN run_processes p ON p.run_id = ac.last_run_id AND p.cmd = pc.cmd
 ORDER BY pc.host_count, pc.total_instances DESC;
 
 -- USB devices that are rare across the fleet
+-- Uses only latest run per asset for accurate fleet-wide analysis
 DROP VIEW IF EXISTS v_rare_usb_devices;
 CREATE VIEW v_rare_usb_devices AS
 WITH usb_counts AS (
@@ -1234,9 +1459,9 @@ WITH usb_counts AS (
     u.vendor_id || ':' || u.product_id as device_id,
     u.vendor_name,
     u.product_name,
-    COUNT(DISTINCT r.asset_id) as host_count
-  FROM run_usb_devices u
-  JOIN runs r ON r.run_id = u.run_id
+    COUNT(DISTINCT ac.asset_id) as host_count
+  FROM v_asset_current ac
+  JOIN run_usb_devices u ON u.run_id = ac.last_run_id
   GROUP BY u.vendor_id, u.product_id, u.vendor_name, u.product_name
   HAVING host_count <= 2  -- Only appears on 2 or fewer hosts
 )
@@ -1250,21 +1475,21 @@ SELECT
   u.device_number,
   u.serial_number
 FROM usb_counts uc
-JOIN run_usb_devices u ON u.vendor_id || ':' || u.product_id = uc.device_id
-JOIN runs r ON r.run_id = u.run_id
-JOIN v_asset_current ac ON ac.asset_id = r.asset_id
+JOIN v_asset_current ac ON ac.last_run_id IS NOT NULL
+JOIN run_usb_devices u ON u.run_id = ac.last_run_id AND u.vendor_id || ':' || u.product_id = uc.device_id
 ORDER BY uc.host_count, uc.device_id;
 
 -- Kernel modules that are rare across the fleet
+-- Uses only latest run per asset for accurate fleet-wide analysis
 DROP VIEW IF EXISTS v_rare_kernel_modules;
 CREATE VIEW v_rare_kernel_modules AS
 WITH module_counts AS (
   SELECT
     m.module,
-    COUNT(DISTINCT r.asset_id) as host_count,
+    COUNT(DISTINCT ac.asset_id) as host_count,
     COUNT(*) as total_instances
-  FROM run_lsmod m
-  JOIN runs r ON r.run_id = m.run_id
+  FROM v_asset_current ac
+  JOIN run_lsmod m ON m.run_id = ac.last_run_id
   GROUP BY m.module
   HAVING host_count <= 2  -- Only appears on 2 or fewer hosts
 )
@@ -1279,22 +1504,22 @@ SELECT
   mi_desc.v as description,
   mi_lic.v as license
 FROM module_counts mc
-JOIN run_lsmod m ON m.module = mc.module
-JOIN runs r ON r.run_id = m.run_id
-JOIN v_asset_current ac ON ac.asset_id = r.asset_id
-LEFT JOIN run_modinfo_kv mi_desc ON mi_desc.run_id = r.run_id AND mi_desc.module = m.module AND mi_desc.k = 'description'
-LEFT JOIN run_modinfo_kv mi_lic ON mi_lic.run_id = r.run_id AND mi_lic.module = m.module AND mi_lic.k = 'license'
+JOIN v_asset_current ac ON ac.last_run_id IS NOT NULL
+JOIN run_lsmod m ON m.run_id = ac.last_run_id AND m.module = mc.module
+LEFT JOIN run_modinfo_kv mi_desc ON mi_desc.run_id = ac.last_run_id AND mi_desc.module = m.module AND mi_desc.k = 'description'
+LEFT JOIN run_modinfo_kv mi_lic ON mi_lic.run_id = ac.last_run_id AND mi_lic.module = m.module AND mi_lic.k = 'license'
 ORDER BY mc.host_count, mc.total_instances DESC;
 
 -- Mount points that are unique to specific hosts (from lsblk mountpoints)
+-- Uses only latest run per asset for accurate fleet-wide analysis
 DROP VIEW IF EXISTS v_unique_mounts;
 CREATE VIEW v_unique_mounts AS
 WITH mount_counts AS (
   SELECT
     d.mountpoints,
-    COUNT(DISTINCT r.asset_id) as host_count
-  FROM run_block_devices d
-  JOIN runs r ON r.run_id = d.run_id
+    COUNT(DISTINCT ac.asset_id) as host_count
+  FROM v_asset_current ac
+  JOIN run_block_devices d ON d.run_id = ac.last_run_id
   WHERE d.mountpoints IS NOT NULL
     AND d.mountpoints != ''
     AND d.mountpoints NOT LIKE '/proc%'
@@ -1311,9 +1536,8 @@ SELECT
   d.name,
   d.type
 FROM mount_counts mc
-JOIN run_block_devices d ON d.mountpoints = mc.mountpoints
-JOIN runs r ON r.run_id = d.run_id
-JOIN v_asset_current ac ON ac.asset_id = r.asset_id
+JOIN v_asset_current ac ON ac.last_run_id IS NOT NULL
+JOIN run_block_devices d ON d.run_id = ac.last_run_id AND d.mountpoints = mc.mountpoints
 ORDER BY ac.hostname, mc.mountpoints;
 
 -- =========================
@@ -1465,6 +1689,8 @@ CREATE INDEX IF NOT EXISTS idx_run_users_run_username ON run_users(run_id, usern
 CREATE INDEX IF NOT EXISTS idx_run_lastlog_run_username ON run_lastlog(run_id, username);
 CREATE INDEX IF NOT EXISTS idx_run_processes_run_uid ON run_processes(run_id, uid);
 CREATE INDEX IF NOT EXISTS idx_run_file_listings_run_source ON run_file_listings(run_id, source);
+CREATE INDEX IF NOT EXISTS idx_run_lshw_devices_run_class ON run_lshw_devices(run_id, class);
+CREATE INDEX IF NOT EXISTS idx_run_ntp_servers_run_type ON run_ntp_servers(run_id, server_type);
 CREATE INDEX IF NOT EXISTS idx_findings_run_severity ON findings(run_id, severity);
 CREATE INDEX IF NOT EXISTS idx_findings_category ON findings(run_id, category);
 

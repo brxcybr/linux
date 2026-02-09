@@ -74,6 +74,7 @@ def command_tag_for(command: str) -> str:
         ("lsblk -a", "lsblk_a"),
         ("df -B1", "df_B1"),
         ("dmidecode", "dmidecode"),
+        ("lshw -disable dmi", "lshw_disable_dmi"),
         ("lspci -v", "lspci_v"),
         ("lsusb -v", "lsusb_v"),
         (
@@ -118,6 +119,8 @@ def command_tag_for(command: str) -> str:
         ("find /bin /sbin /usr/{bin,sbin} /usr/local/{bin,sbin} -maxdepth 1 -mtime 180 | xargs -r ls -l", "recent_bins"),
         ("find /bin /sbin /usr/{bin,sbin} /usr/local/{bin,sbin} -maxdepth 1 -mtime 180 -exec ls -l {} +", "recent_bins"),
         ("getcap -r /", "getcap_r"),
+        ("getcap -r /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin /opt 2>/dev/null", "getcap_r"),
+        ("getcap -r /etc /root 2>/dev/null", "getcap_r"),
         ("cat /root/.bash_history", "root_bash_history"),
         ("printenv", "printenv"),
         ("set", "shell_set"),
@@ -147,6 +150,10 @@ def command_tag_for(command: str) -> str:
         ("cat /etc/sudoers.d/*", "sudoers_d_cat"),
         ("cat /etc/rsyslog.conf", "rsyslog_conf"),
         ("cat /etc/systemd/journald.conf", "journald_conf"),
+        ("cat /etc/ntp.conf", "ntp_conf"),
+        ("cat /etc/chrony.conf", "chrony_conf"),
+        ("cat /etc/systemd/timesyncd.conf", "timesyncd_conf"),
+        ("cat /etc/chrony/chrony.conf", "chrony_conf"),
         ("cat /etc/login.defs", "login_defs"),
         ("docker ps -a", "docker_ps_a"),
         ("docker info", "docker_info"),
@@ -383,17 +390,23 @@ def _parse_getcap_r(output: str) -> list[tuple[str, str]]:
     """
     Parses getcap output lines like:
       /usr/bin/ping = cap_net_raw+ep
+    Skips "getcap not installed", errors, and lines without capability syntax (cap_*).
     """
     rows: list[tuple[str, str]] = []
     for line in output.splitlines():
         line = line.strip()
         if not line or "=" not in line:
             continue
+        if "not installed" in line.lower() or line.startswith("getcap:"):
+            continue
         left, right = line.split("=", 1)
         path = left.strip()
         caps = right.strip()
-        if path and caps:
-            rows.append((path, caps))
+        if not path or not caps:
+            continue
+        if "cap_" not in caps and "=" not in caps:
+            continue
+        rows.append((path, caps))
     return rows
 
 
@@ -611,22 +624,35 @@ def _parse_free_h(output: str) -> dict[str, Optional[int]]:
     }
 
 
-_LSBLK_TREE_PREFIX_RE = re.compile(r"^[^A-Za-z0-9]+")
+_LSBLK_TREE_PREFIX_RE = re.compile(r"^[\s├└│\-]+")
 
 
 def _parse_lsblk_a(output: str) -> list[dict[str, object]]:
+    """
+    Parse lsblk -a output. Tracks tree prefix (├─, └─, etc.) to set parent_name
+    for partitions and other child devices.
+    """
     rows: list[dict[str, object]] = []
+    parent_by_depth: list[str] = []
+
     for line in output.splitlines():
         line = line.rstrip("\n")
         if not line.strip():
             continue
-        if line.startswith("NAME "):
+        if line.startswith("NAME ") or "MAJ:MIN" in line:
             continue
-        parts = line.split(maxsplit=6)
+        # Tree prefix: leading whitespace + ├─ or └─
+        prefix_len = len(line) - len(line.lstrip())
+        depth_level = 0
+        if prefix_len > 0:
+            depth_level = min(1 + (prefix_len // 2), 10)
+
+        name_raw = line.lstrip()
+        parts = name_raw.split(maxsplit=6)
         if len(parts) < 6:
             continue
-        name_raw = parts[0]
-        name = _LSBLK_TREE_PREFIX_RE.sub("", name_raw) or name_raw
+        # Strip tree chars from first column to get device name (e.g. └─sda1 -> sda1)
+        name = _LSBLK_TREE_PREFIX_RE.sub("", parts[0]).strip() or parts[0]
         rm = None
         ro = None
         try:
@@ -640,10 +666,23 @@ def _parse_lsblk_a(output: str) -> list[dict[str, object]]:
             pass
         dev_type = parts[5]
         mountpoints = parts[6] if len(parts) >= 7 else ""
+
+        parent_name = None
+        if depth_level > 0 and (depth_level - 1) < len(parent_by_depth):
+            parent_name = parent_by_depth[depth_level - 1]
+
+        while len(parent_by_depth) > depth_level:
+            parent_by_depth.pop()
+        if depth_level >= len(parent_by_depth):
+            parent_by_depth.append(name)
+        else:
+            parent_by_depth[depth_level] = name
+
         rows.append(
             {
                 "name": name,
                 "type": dev_type,
+                "parent_name": parent_name,
                 "size_bytes": size_bytes,
                 "rm": rm,
                 "ro": ro,
@@ -707,6 +746,86 @@ def _parse_rsyslog_remote_destinations(output: str) -> list[str]:
     return list(dict.fromkeys(dests))  # dedupe, preserve order
 
 
+def _parse_ntp_conf(output: str) -> list[dict[str, object]]:
+    """
+    Extract NTP server entries from /etc/ntp.conf.
+    Lines: server host [options] or pool host [options]
+    """
+    servers: list[dict[str, object]] = []
+    for line in output.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split()
+        if len(parts) < 2:
+            continue
+        if parts[0] in ("server", "pool"):
+            server_addr = parts[1]
+            options = " ".join(parts[2:]) if len(parts) > 2 else None
+            is_pool = parts[0] == "pool"
+            servers.append({
+                "server_type": "ntp",
+                "server_address": server_addr,
+                "options": options,
+                "pool": is_pool,
+            })
+    return servers
+
+
+def _parse_chrony_conf(output: str) -> list[dict[str, object]]:
+    """
+    Extract Chrony server entries from /etc/chrony.conf or /etc/chrony/chrony.conf.
+    Lines: server host [options] or pool host [options]
+    """
+    servers: list[dict[str, object]] = []
+    for line in output.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split()
+        if len(parts) < 2:
+            continue
+        if parts[0] in ("server", "pool"):
+            server_addr = parts[1]
+            options = " ".join(parts[2:]) if len(parts) > 2 else None
+            is_pool = parts[0] == "pool"
+            servers.append({
+                "server_type": "chrony",
+                "server_address": server_addr,
+                "options": options,
+                "pool": is_pool,
+            })
+    return servers
+
+
+def _parse_timesyncd_conf(output: str) -> list[dict[str, object]]:
+    """
+    Extract timesyncd NTP servers from /etc/systemd/timesyncd.conf.
+    Lines: NTP=host1 host2 ... or FallbackNTP=host1 host2 ...
+    """
+    servers: list[dict[str, object]] = []
+    for line in output.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith("["):
+            continue
+        if "=" not in s:
+            continue
+        key, _, value = s.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key in ("NTP", "FallbackNTP"):
+            for addr in value.split():
+                addr = addr.strip()
+                if addr:
+                    servers.append({
+                        "server_type": "timesyncd",
+                        "server_address": addr,
+                        "options": None,
+                        "pool": False,
+                    })
+    return servers
+
+
 def _parse_journald_remote(output: str) -> dict[str, str]:
     """
     Extract [Journal] ForwardToSyslog, ForwardToWall, etc. and remote-related keys.
@@ -761,15 +880,58 @@ def _parse_login_defs_kv(output: str) -> dict[str, str]:
     return kv
 
 
+# Placeholder values that some vendors (e.g. ASUS) put in DMI when field is not populated
+_DMI_PLACEHOLDER_VALUES = frozenset([
+    "to be filled by o.e.m.",
+    "to be filled by oem",
+    "o.e.m.",
+    "oem",
+    "default string",
+    "system product name",
+    "system serial number",
+    "system manufacturer",
+    "system version",
+    "base board product",
+    "chassis serial number",
+    "not specified",
+    "none",
+    "n/a",
+    "",
+])
+
+
+def _normalize_dmi_value(k: str, v: str) -> Optional[str]:
+    """Return None if value is placeholder or same as key (e.g. ASUS 'Product Name: Product Name')."""
+    if not v or not v.strip():
+        return None
+    v = v.strip()
+    k_lower = k.strip().lower()
+    v_lower = v.lower()
+    # Value same as key (common when BIOS doesn't populate)
+    if v_lower == k_lower:
+        return None
+    # Known placeholder strings
+    if v_lower in _DMI_PLACEHOLDER_VALUES:
+        return None
+    # "To be filled by O.E.M." style
+    if "to be filled" in v_lower and "o.e.m" in v_lower:
+        return None
+    return v
+
+
 def _parse_dmidecode_system(output: str) -> dict[str, str]:
     """
-    Extracts key identity fields from the "System Information" section.
+    Extracts key identity fields from the first "System Information" (DMI type 1) section.
+    Skips placeholder values and "key: key" patterns used by some vendors (e.g. ASUS).
     """
     kv: dict[str, str] = {}
     in_sys = False
     for line in output.splitlines():
-        if line.startswith("Handle ") and in_sys:
-            break
+        # Start of a new handle block - stop after first System Information block
+        if line.startswith("Handle "):
+            if in_sys:
+                break
+            continue
         if line.strip() == "System Information":
             in_sys = True
             continue
@@ -780,8 +942,11 @@ def _parse_dmidecode_system(output: str) -> dict[str, str]:
             k, v = line.split(":", 1)
             k = k.strip()
             v = v.strip()
-            if k:
-                kv[k] = v
+            if not k:
+                continue
+            normalized = _normalize_dmi_value(k, v)
+            if normalized is not None:
+                kv[k] = normalized
     return kv
 
 
@@ -841,6 +1006,91 @@ def _parse_lspci_v_gpus(output: str) -> list[dict[str, Optional[str]]]:
             }
         )
     return out
+
+
+_LSHW_NODE_RE = re.compile(r"^\s*\*-(\w+)(?::(\S+))?\s*$")
+
+
+def _parse_lshw(output: str) -> list[dict[str, object]]:
+    """
+    Parse `lshw -disable dmi` tree output into one dict per device node.
+    Each line is either "  *-class" / "  *-class:logical" (node) or "    key: value" (property).
+    """
+    rows: list[dict[str, object]] = []
+    depth = 0
+    class_name = ""
+    logical_name: Optional[str] = None
+    props: dict[str, str] = {}
+
+    def flush() -> None:
+        nonlocal props
+        if not class_name:
+            return
+        size = props.get("size")
+        capacity = props.get("capacity")
+        width_bits = None
+        clock_hz = None
+        if size:
+            m = re.match(r"^(\d+)\s*[KMGTP]i?B$", size.strip(), re.IGNORECASE)
+            if m:
+                pass  # keep as text
+        if capacity and re.match(r"^\d+\s*[KMG]?Hz", capacity, re.IGNORECASE):
+            try:
+                clock_hz = int(re.sub(r"\s*[KMG]?Hz.*", "", capacity).replace(" ", ""))
+                if "GHz" in capacity.upper():
+                    clock_hz *= 1_000_000_000
+                elif "MHz" in capacity.upper():
+                    clock_hz *= 1_000_000
+            except ValueError:
+                pass
+        width_str = props.get("width")
+        if width_str:
+            try:
+                width_bits = int(re.sub(r"\D", "", width_str))
+            except ValueError:
+                pass
+        rows.append({
+            "depth": depth,
+            "class": class_name,
+            "logical_name": logical_name or None,
+            "description": props.get("description") or None,
+            "product": props.get("product") or None,
+            "vendor": props.get("vendor") or None,
+            "physical_id": props.get("physical id") or None,
+            "bus_info": props.get("bus info") or None,
+            "slot": props.get("slot") or None,
+            "size": props.get("size") or None,
+            "capacity": props.get("capacity") or None,
+            "serial": props.get("serial") or None,
+            "version": props.get("version") or None,
+            "width_bits": width_bits,
+            "clock_hz": clock_hz,
+            "raw_line": f"*-{class_name}" + (f":{logical_name}" if logical_name else ""),
+        })
+        props = {}
+
+    for line in output.splitlines():
+        stripped = line.rstrip()
+        if not stripped:
+            continue
+        indent = len(line) - len(line.lstrip())
+        d = indent // 2
+        m = _LSHW_NODE_RE.match(line)
+        if m:
+            flush()
+            depth = d
+            class_name = m.group(1) or ""
+            logical_name = m.group(2) if m.group(2) else None
+            props = {}
+            continue
+        if ":" in stripped and class_name:
+            k, _, v = stripped.strip().partition(":")
+            k = k.strip()
+            v = v.strip()
+            if k:
+                props[k] = v
+    flush()
+    return rows
 
 
 def _parse_getent_group(output: str) -> list[tuple[str, Optional[int], str]]:
@@ -1117,6 +1367,46 @@ def _parse_last(output: str, source: str) -> list[dict[str, Optional[str]]]:
     return rows
 
 
+def normalize_timestamp_with_timezone(text: str, timezone_str: Optional[str], collected_at: str) -> Optional[str]:
+    """
+    Normalize timestamp to UTC using system timezone from timedatectl.
+    Falls back to normalize_timestamp_to_utc if timezone not available.
+    """
+    if not text or not text.strip():
+        return None
+    
+    # First try with timezone-aware parsing
+    if timezone_str:
+        try:
+            import zoneinfo
+            tz = zoneinfo.ZoneInfo(timezone_str)
+            # Try parsing the timestamp and converting to UTC
+            parsed = None
+            # Try common formats
+            for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%b %d %H:%M:%S", "%b %d %H:%M"]:
+                try:
+                    if "%b" in fmt:
+                        # Need year
+                        reference_year = dt.datetime.fromisoformat(collected_at.replace('Z', '+00:00')).year
+                        parsed = dt.datetime.strptime(f"{reference_year} {text.strip()}", f"%Y {fmt}")
+                    else:
+                        parsed = dt.datetime.strptime(text.strip(), fmt)
+                    break
+                except ValueError:
+                    continue
+            
+            if parsed:
+                # Localize to system timezone, then convert to UTC
+                parsed = tz.localize(parsed.replace(tzinfo=None))
+                return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            # Fall through to fallback
+            pass
+    
+    # Fallback to original normalization
+    return normalize_timestamp_to_utc(text, collected_at)
+
+
 def normalize_timestamp_to_utc(text: str, collected_at: str) -> Optional[str]:
     """
     Attempt to normalize various timestamp formats to ISO UTC.
@@ -1129,40 +1419,68 @@ def normalize_timestamp_to_utc(text: str, collected_at: str) -> Optional[str]:
 
     text = text.strip()
 
-    # Try various common formats
-    formats = [
-        "%Y-%m-%d %H:%M",    # 2024-01-15 14:30
-        "%b %d %H:%M",       # Jan 15 14:30 (current year)
-        "%a %b %d %H:%M",    # Mon Jan 15 14:30 (current year)
-        "%Y-%m-%dT%H:%M:%S", # ISO format
-        "%m/%d/%y %H:%M",    # 01/15/24 14:30
-        "%m/%d/%Y %H:%M",    # 01/15/2024 14:30
-    ]
-
-    # Parse collected_at to get reference year
+    # Parse collected_at to get reference year/month
     try:
         collected_dt = dt.datetime.fromisoformat(collected_at.replace('Z', '+00:00'))
         reference_year = collected_dt.year
+        reference_month = collected_dt.month
     except:
         reference_year = dt.datetime.now().year
+        reference_month = dt.datetime.now().month
 
-    for fmt in formats:
+    # Try various common formats (ordered by specificity)
+    formats = [
+        ("%Y-%m-%d %H:%M:%S", None),      # 2024-01-15 14:30:45
+        ("%Y-%m-%d %H:%M", None),          # 2024-01-15 14:30
+        ("%Y-%m-%dT%H:%M:%S", None),       # ISO format without TZ
+        ("%Y-%m-%dT%H:%M:%SZ", None),      # ISO format with Z
+        ("%Y-%m-%dT%H:%M:%S%z", None),     # ISO format with TZ offset
+        ("%a %b %d %H:%M:%S %Y", None),    # Mon Jan 15 14:30:45 2024
+        ("%a %b %d %H:%M %Y", None),       # Mon Jan 15 14:30 2024
+        ("%b %d %H:%M:%S %Y", None),       # Jan 15 14:30:45 2024
+        ("%b %d %H:%M %Y", None),          # Jan 15 14:30 2024
+        ("%m/%d/%Y %H:%M:%S", None),       # 01/15/2024 14:30:45
+        ("%m/%d/%Y %H:%M", None),          # 01/15/2024 14:30
+        ("%m/%d/%y %H:%M:%S", None),       # 01/15/24 14:30:45
+        ("%m/%d/%y %H:%M", None),          # 01/15/24 14:30
+        ("%d/%m/%Y %H:%M:%S", None),       # 15/01/2024 14:30:45 (DD/MM/YYYY)
+        ("%d/%m/%Y %H:%M", None),          # 15/01/2024 14:30
+        ("%d-%m-%Y %H:%M:%S", None),       # 15-01-2024 14:30:45
+        ("%d-%m-%Y %H:%M", None),          # 15-01-2024 14:30
+        ("%a %b %d %H:%M:%S", reference_year),  # Mon Jan 15 14:30:45 (assume current year)
+        ("%a %b %d %H:%M", reference_year),     # Mon Jan 15 14:30 (assume current year)
+        ("%b %d %H:%M:%S", reference_year),     # Jan 15 14:30:45 (assume current year)
+        ("%b %d %H:%M", reference_year),        # Jan 15 14:30 (assume current year)
+    ]
+
+    for fmt, year_override in formats:
         try:
-            if fmt == "%b %d %H:%M":
-                # Month day hour:min - assume current year
-                parsed = dt.datetime.strptime(f"{reference_year} {text}", f"%Y {fmt}")
-            elif fmt == "%a %b %d %H:%M":
-                # Day month day hour:min - assume current year
-                parsed = dt.datetime.strptime(f"{reference_year} {text}", f"%Y {fmt}")
+            if year_override:
+                # Format needs year prepended
+                parsed = dt.datetime.strptime(f"{year_override} {text}", f"%Y {fmt}")
             else:
                 parsed = dt.datetime.strptime(text, fmt)
 
             # If parsed year is in future relative to collection, assume it's from previous year
             if parsed.year > reference_year:
                 parsed = parsed.replace(year=reference_year - 1)
+            # If parsed date is more than 6 months in the future relative to collection month,
+            # assume it's from previous year (handles year boundary cases)
+            elif parsed.year == reference_year:
+                month_diff = parsed.month - reference_month
+                if month_diff > 6:
+                    parsed = parsed.replace(year=reference_year - 1)
+                elif month_diff < -6:
+                    # More than 6 months in past - might be from next year (unlikely but handle)
+                    pass
 
-            # Convert to UTC (assuming local time)
-            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            # If format already has timezone info, preserve it; otherwise assume UTC
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            else:
+                # Convert to UTC if timezone-aware
+                parsed = parsed.astimezone(dt.timezone.utc)
+
             return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
         except ValueError:
             continue
@@ -1195,6 +1513,7 @@ def extract_failed_login_events(last_events: list[dict]) -> list[dict]:
             'username': username,
             'remote_host': remote_host,
             'tty': event.get('tty', ''),
+            'state_text': event.get('status_text'),
             'attempt_time': normalized_time,
             'raw_start_text': start_text,
             'raw_line': event.get('raw_line', ''),
@@ -1254,7 +1573,7 @@ def _parse_audit_rule_detailed(rule_text: str) -> dict[str, Optional[str]]:
         result["key_name"] = m.group(1) or m.group(2)
 
     # Extract action and list (-a always,exit or -A always,exit)
-    m2 = re.search(r"-[aA]\s+([^,]+),([^\\s]+)", rule_text)
+    m2 = re.search(r"-[aA]\s+([^,]+),([^\s]+)", rule_text)
     if m2:
         result["action"] = m2.group(1)
         result["list_type"] = m2.group(2)
@@ -1265,13 +1584,13 @@ def _parse_audit_rule_detailed(rule_text: str) -> dict[str, Optional[str]]:
         result["arch"] = m3.group(1)
 
     # Extract syscall number/name
-    m4 = re.search(r"\b(?:syscall|syscall_r)=([^\\s]+)", rule_text)
+    m4 = re.search(r"\b(?:syscall|syscall_r)=([^\s]+)", rule_text)
     if m4:
         result["syscall"] = m4.group(1)
         result["rule_type"] = "syscall"
 
     # Extract file path
-    m5 = re.search(r"(?:-F\s+path=|path=)([^\\s]+)", rule_text)
+    m5 = re.search(r"(?:-F\s+path=|path=)([^\s]+)", rule_text)
     if m5:
         result["path"] = m5.group(1)
         result["rule_type"] = "file"
@@ -1281,21 +1600,33 @@ def _parse_audit_rule_detailed(rule_text: str) -> dict[str, Optional[str]]:
     if m6:
         result["permission"] = m6.group(1)
 
-    # Extract UIDs
-    m7 = re.search(r"\b(?:auid|uid|gid)=([^\\s]+)", rule_text)
-    if m7:
-        uid_type = None
-        if "auid=" in rule_text:
-            result["auid"] = m7.group(1)
-        elif "uid=" in rule_text:
-            result["uid"] = m7.group(1)
-        elif "gid=" in rule_text:
-            result["gid"] = m7.group(1)
+    # Extract UIDs/GIDs: audit rules use -F auid=, -F auid>=, -F auid!=, -F uid=, -F euid=, -F gid=, -F egid=
+    # Capture operator+value (e.g. ">=1000", "!=-1", "=0") so stored value is meaningful
+    def _capture_id_filter(prefix: str, text: str) -> Optional[str]:
+        # Match prefix followed by optional comparison (=, !=, >=, <=, >, <) and value
+        m = re.search(rf"\b{prefix}([<>=!]*=)([^\s]+)", text)
+        if m:
+            op, val = m.group(1), m.group(2)
+            return f"{op}{val}" if op != "=" else val
+        return None
 
-    # Extract SELinux subject
-    m8 = re.search(r"\bsubj=([^\\s]+)", rule_text)
+    result["auid"] = _capture_id_filter("auid", rule_text)
+    # uid= (standalone, not auid/euid); then fallback to euid= for uid column if schema supports it
+    result["uid"] = _capture_id_filter("uid", rule_text)
+    if not result["uid"]:
+        result["uid"] = _capture_id_filter("euid", rule_text)
+    result["gid"] = _capture_id_filter("gid", rule_text)
+    if not result["gid"]:
+        result["gid"] = _capture_id_filter("egid", rule_text)
+
+    # Extract SELinux subject (subj= value can be single token or quoted)
+    m8 = re.search(r'\bsubj=("([^"]*)"|([^\s\-][^\s]*))', rule_text)
     if m8:
-        result["subj"] = m8.group(1)
+        result["subj"] = (m8.group(2) or m8.group(3) or "").strip()
+    if not result["subj"]:
+        m8b = re.search(r"\bsubj=([^\s]+)", rule_text)
+        if m8b:
+            result["subj"] = m8b.group(1)
 
     # Determine rule type if not set
     if not result["rule_type"]:
@@ -1424,11 +1755,11 @@ def _parse_aa_status(output: str) -> dict[str, Optional[int] | str]:
             return int(m.group(1))
         except ValueError:
             return None
-    out["profiles_loaded"] = grab(r"(\\d+)\\s+profiles are loaded")
-    out["profiles_enforce"] = grab(r"(\\d+)\\s+profiles are in enforce mode")
-    out["profiles_complain"] = grab(r"(\\d+)\\s+profiles are in complain mode")
-    out["processes_enforce"] = grab(r"(\\d+)\\s+processes have profiles defined")
-    out["processes_complain"] = grab(r"(\\d+)\\s+processes are in enforce mode")  # best-effort
+    out["profiles_loaded"] = grab(r"(\d+)\s+profiles are loaded")
+    out["profiles_enforce"] = grab(r"(\d+)\s+profiles are in enforce mode")
+    out["profiles_complain"] = grab(r"(\d+)\s+profiles are in complain mode")
+    out["processes_enforce"] = grab(r"(\d+)\s+processes have profiles defined")
+    out["processes_complain"] = grab(r"(\d+)\s+processes are in enforce mode")
     return out
 
 
@@ -1553,7 +1884,9 @@ def _parse_ip_neigh(output: str) -> list[dict[str, Optional[str]]]:
                 lladdr = toks[toks.index("lladdr") + 1]
             except Exception:
                 lladdr = None
-        rows.append({"ip": ip, "dev": dev, "lladdr": lladdr, "state": state, "raw_line": raw})
+        family = "inet6" if (ip and ":" in ip) else "inet"
+        ip_type = _classify_addr_type(family, ip or "") if ip else None
+        rows.append({"ip": ip, "dev": dev, "lladdr": lladdr, "state": state, "ip_type": ip_type, "raw_line": raw})
     return rows
 
 
@@ -1684,6 +2017,43 @@ def _parse_nmcli_summary(output: str) -> dict[str, Optional[str] | str]:
     return {"raw_text": raw, "state": state, "connectivity": conn, "wifi_hw": wifi_hw, "wifi": wifi, "wwan_hw": wwan_hw, "wwan": wwan}
 
 
+def _extract_process_details(cmd: str) -> tuple[str, str, str]:
+    """
+    Extract process_name, process_path, and process_arguments from cmd string.
+    Returns (process_name, process_path, process_arguments)
+    """
+    if not cmd:
+        return ("", "", "")
+    
+    cmd = cmd.strip()
+    
+    # Handle kernel threads [name]
+    if cmd.startswith("[") and cmd.endswith("]"):
+        return (cmd, cmd, "")
+    
+    # Split command into executable and arguments
+    # Handle quoted paths and arguments
+    import shlex
+    try:
+        parts = shlex.split(cmd, posix=True)
+    except (ValueError, AttributeError):
+        # Fallback: simple split on spaces
+        parts = cmd.split(None, 1)
+    
+    if not parts:
+        return ("", "", "")
+    
+    process_path = parts[0]
+    
+    # Extract process name (basename)
+    process_name = os.path.basename(process_path)
+    
+    # Extract arguments (everything after executable)
+    process_arguments = " ".join(parts[1:]) if len(parts) > 1 else ""
+    
+    return (process_name, process_path, process_arguments)
+
+
 def _parse_ps_elf(output: str) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     lines = [ln.rstrip() for ln in output.splitlines() if ln.strip()]
@@ -1710,6 +2080,10 @@ def _parse_ps_elf(output: str) -> list[dict[str, object]]:
         tty = parts[12]
         cpu_time = parts[13]
         cmd = parts[14]
+        
+        # Extract process details
+        process_name, process_path, process_arguments = _extract_process_details(cmd)
+        
         rows.append(
             {
                 "pid": pid,
@@ -1720,6 +2094,9 @@ def _parse_ps_elf(output: str) -> list[dict[str, object]]:
                 "start": start_time,
                 "time": cpu_time,
                 "cmd": cmd,
+                "process_name": process_name,
+                "process_path": process_path,
+                "process_arguments": process_arguments,
                 "raw_line": ln,
             }
         )
@@ -1916,6 +2293,50 @@ _LS_LONG_RE = re.compile(
 )
 
 
+def _rwx_to_octal(perms: str) -> Optional[int]:
+    """Convert ls-style perms (e.g. drwxr-xr-x) to octal (e.g. 755). Best-effort."""
+    if not perms or len(perms) < 10:
+        return None
+    try:
+        u = (4 if perms[1] == "r" else 0) + (2 if perms[2] == "w" else 0) + (1 if perms[3] in "xsS" else 0)
+        g = (4 if perms[4] == "r" else 0) + (2 if perms[5] == "w" else 0) + (1 if perms[6] in "xsS" else 0)
+        o = (4 if perms[7] == "r" else 0) + (2 if perms[8] == "w" else 0) + (1 if perms[9] in "xstT" else 0)
+        return u * 100 + g * 10 + o
+    except (IndexError, TypeError):
+        return None
+
+
+def _normalize_mtime_file(mtime_text: Optional[str], timezone_str: Optional[str], collected_at: Optional[str]) -> Optional[str]:
+    """Parse ls-style mtime (e.g. 'Nov 13 2025' or 'Jan  4 22:28') to ISO UTC."""
+    if not mtime_text or not collected_at:
+        return None
+    text = mtime_text.strip()
+    if not text:
+        return None
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(timezone_str) if timezone_str else dt.timezone.utc
+    except Exception:
+        return None
+    ref_dt = dt.datetime.fromisoformat(collected_at.replace("Z", "+00:00"))
+    parsed = None
+    for fmt in ["%b %d %Y", "%b %d %H:%M"]:
+        try:
+            parsed = dt.datetime.strptime(text, fmt)
+            break
+        except ValueError:
+            continue
+    if parsed is not None and parsed.year == 1900:
+        parsed = parsed.replace(year=ref_dt.year)
+    if parsed is None:
+        return None
+    try:
+        localized = parsed.replace(tzinfo=tz)
+        return localized.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
 def _parse_ls_latR(output: str) -> list[dict[str, object]]:
     """
     Parses `ls -latR` output with directory headers like `/etc/cron.d:`.
@@ -1940,19 +2361,30 @@ def _parse_ls_latR(output: str) -> list[dict[str, object]]:
         size_bytes = int(m.group("size"))
         mtime_text = f"{m.group('mon')} {m.group('day')} {m.group('timeyear')}"
         name = m.group("name")
+        symlink_target = None
+        if " -> " in name:
+            name, _, symlink_target = name.partition(" -> ")
+            name = name.strip()
+            symlink_target = symlink_target.strip() or None
         file_type = "dir" if perms.startswith("d") else "link" if perms.startswith("l") else "file"
+        is_symlink = 1 if perms.startswith("l") else 0
         path = f"{current_dir}/{name}" if current_dir else name
+        filename = name
         rows.append(
             {
                 "directory": current_dir,
                 "path": path,
                 "perms": perms,
+                "perm_octal": _rwx_to_octal(perms),
                 "owner": owner,
                 "grp": grp,
                 "size_bytes": size_bytes,
                 "mtime_text": mtime_text,
                 "name": name,
+                "filename": filename,
                 "file_type": file_type,
+                "is_symlink": is_symlink,
+                "symlink_target": symlink_target,
                 "raw_line": raw,
             }
         )
@@ -2287,18 +2719,28 @@ def _parse_ls_l(output: str) -> list[dict[str, object]]:
         size_bytes = int(m.group("size"))
         mtime_text = f"{m.group('mon')} {m.group('day')} {m.group('timeyear')}"
         name = m.group("name")
+        symlink_target = None
+        if " -> " in name:
+            name, _, symlink_target = name.partition(" -> ")
+            name = name.strip()
+            symlink_target = symlink_target.strip() or None
         file_type = "dir" if perms.startswith("d") else "link" if perms.startswith("l") else "file"
+        is_symlink = 1 if perms.startswith("l") else 0
         rows.append(
             {
                 "directory": None,
                 "path": name,
                 "perms": perms,
+                "perm_octal": _rwx_to_octal(perms),
                 "owner": owner,
                 "grp": grp,
                 "size_bytes": size_bytes,
                 "mtime_text": mtime_text,
                 "name": name,
+                "filename": name,
                 "file_type": file_type,
+                "is_symlink": is_symlink,
+                "symlink_target": symlink_target,
                 "raw_line": raw,
             }
         )
@@ -2357,6 +2799,28 @@ def _split_members_csv(members_csv: Optional[str]) -> list[str]:
     return out
 
 
+# Well-known system/daemon group names (service); GID 0-999 typical. Rare = worth flagging for review.
+_WELL_KNOWN_GROUP_NAMES: frozenset[str] = frozenset({
+    "root", "bin", "daemon", "sys", "adm", "tty", "disk", "lp", "mem", "kmem", "wheel",
+    "mail", "uucp", "man", "dbus", "nobody", "nogroup", "messagebus", "polkitd", "rtkit",
+    "systemd-journal", "systemd-timesync", "systemd-network", "systemd-resolve", "systemd-bus-proxy",
+    "input", "kvm", "render", "crontab", "sasl", "ssh", "colord", "avahi", "usbmux", "geoclue",
+    "pulse", "pulse-access", "gdm", "sddm", "lpadmin", "sambashare", "docker", "libvirt",
+    "nopasswdlogin", "sudo", "cdrom", "dialout", "dip", "plugdev", "staff", "users", "video",
+    "bluetooth", "netdev", "kvm", "libvirt-dnsmasq", "libvirt-qemu",
+})
+
+
+def _classify_group_type(groupname: str, gid: Optional[int]) -> str:
+    """Classify group as service (system/daemon), user (user-range), or rare (uncommon)."""
+    gn = (groupname or "").strip().lower()
+    if gn in _WELL_KNOWN_GROUP_NAMES:
+        return "service"
+    if gid is not None and gid >= 1000:
+        return "user"  # typical user gid range
+    return "rare"  # unknown system group or no gid
+
+
 def _parse_passwd_status(output: str) -> list[tuple[str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]]:
     """
     Ubuntu example:
@@ -2387,16 +2851,147 @@ def _parse_passwd_status(output: str) -> list[tuple[str, Optional[str], Optional
 _IP_IFACE_RE = re.compile(r"^\d+:\s+([^:]+):.*\bmtu\s+(\d+)\b.*\bstate\s+(\S+)\b")
 _IP_LINK_ETHER_RE = re.compile(r"^\s+link/ether\s+([0-9a-fA-F:]{17})\b")
 _IP_INET_RE = re.compile(r"^\s+(inet6?|inet)\s+([0-9a-fA-F\.:]+)/(\d+)\b.*?(?:\bscope\s+(\S+)\b)?")
+# Private IPv4 ranges (RFC 1918, etc.)
+_IP4_LOOPBACK = re.compile(r"^127\.\d+\.\d+\.\d+$")
+_IP4_LINK_LOCAL = re.compile(r"^169\.254\.\d+\.\d+$")
+_IP4_PRIVATE = re.compile(r"^(10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)$")
 
 
-def _parse_ip_a(output: str) -> tuple[list[tuple[str, Optional[str], Optional[str], Optional[int]]], list[tuple[str, str, str, int, Optional[str]]]]:
+def _classify_route_dest(destination: Optional[str]) -> str:
+    """Classify route destination: default | host | link | network."""
+    if not destination or not destination.strip():
+        return "network"
+    d = destination.strip()
+    if d == "0.0.0.0":
+        return "default"
+    if d.startswith("127.") or d == "::1":
+        return "host"
+    if d.startswith("169.254.") or d.lower().startswith("fe80:"):
+        return "link"
+    return "network"
+
+
+def _classify_bind_scope(local_addr: Optional[str]) -> str:
+    """Classify listening address: loopback | all_interfaces | specific."""
+    if not local_addr:
+        return "specific"
+    a = local_addr.strip()
+    if a in ("127.0.0.1", "::1") or a.startswith("127."):
+        return "loopback"
+    if a in ("0.0.0.0", "::", "*"):
+        return "all_interfaces"
+    return "specific"
+
+
+def _unit_type_from_name(unit_name: Optional[str]) -> str:
+    """Derive unit type from unit name suffix (.service, .socket, etc.)."""
+    if not unit_name:
+        return "other"
+    u = unit_name.strip()
+    for suffix in (".service", ".socket", ".timer", ".path", ".mount", ".target", ".slice", ".scope"):
+        if u.endswith(suffix):
+            return suffix[1:]
+    return "other"
+
+
+# USB device class codes (common; integer from bDeviceClass)
+_USB_CLASS_LABELS: dict[int, str] = {
+    0x00: "Device",
+    0x01: "Audio",
+    0x02: "CDC",
+    0x03: "HID",
+    0x05: "Physical",
+    0x06: "Image",
+    0x07: "Printer",
+    0x08: "Mass Storage",
+    0x09: "Hub",
+    0x0A: "CDC-Data",
+    0x0B: "Smart Card",
+    0x0D: "Content Security",
+    0x0E: "Video",
+    0x0F: "Healthcare",
+    0x10: "Audio/Video",
+    0xDC: "Diagnostic",
+    0xE0: "Wireless",
+    0xEF: "Misc",
+    0xFE: "Application",
+    0xFF: "Vendor",
+}
+
+
+def _usb_device_class_label(device_class: Optional[int]) -> Optional[str]:
+    if device_class is None:
+        return None
+    return _USB_CLASS_LABELS.get(device_class & 0xFF)
+
+
+def _sudoers_rule_type(rule_text: Optional[str]) -> str:
+    """Derive rule type from first token or alias (Defaults, User_Host, Runas, Cmnd)."""
+    if not rule_text or not rule_text.strip():
+        return "other"
+    s = rule_text.strip()
+    if s.startswith("Defaults"):
+        return "Defaults"
+    if s.startswith("Runas"):
+        return "Runas"
+    if s.startswith("Cmnd"):
+        return "Cmnd"
+    if s.startswith("Host"):
+        return "Host"
+    # User_Host spec: user host = (runas) cmnd
+    if "=" in s and not s.startswith("Defaults"):
+        return "User_Host"
+    return "other"
+
+
+def _classify_iface_type(ifname: str) -> str:
+    """Classify interface by name: loopback, physical, bridge, veth, docker, virtual, other."""
+    name = (ifname or "").strip().lower()
+    if name == "lo":
+        return "loopback"
+    if name.startswith("veth") or "@" in name and "veth" in name:
+        return "veth"
+    if name == "docker0" or name.startswith("docker"):
+        return "docker"
+    if name.startswith("br-") or name.startswith("bridge"):
+        return "bridge"
+    if any(name.startswith(p) for p in ("virbr", "vnet", "vb", "tap", "tun")):
+        return "virtual"
+    if any(name.startswith(p) for p in ("eno", "enp", "ens", "eth", "wlan", "wlp", "wl", "usb", "ib")):
+        return "physical"
+    return "other"
+
+
+def _classify_addr_type(family: str, address: str) -> str:
+    """Classify address as loopback, link_local, private, or public."""
+    addr = (address or "").strip()
+    if family == "inet":
+        if _IP4_LOOPBACK.match(addr):
+            return "loopback"
+        if _IP4_LINK_LOCAL.match(addr):
+            return "link_local"
+        if _IP4_PRIVATE.match(addr):
+            return "private"
+        return "public"
+    if family == "inet6":
+        if addr == "::1" or addr.lower().startswith("::1/"):
+            return "loopback"
+        if addr.lower().startswith("fe80:"):
+            return "link_local"
+        if addr.lower().startswith("fd") or addr.lower().startswith("fc"):
+            return "private"  # RFC 4193 ULA
+        return "public"
+    return "public"
+
+
+def _parse_ip_a(output: str) -> tuple[list[tuple[str, Optional[str], Optional[str], Optional[int], str]], list[tuple[str, str, str, int, Optional[str], str]]]:
     """
     Returns:
-      interfaces: [(ifname, mac, state, mtu)]
-      addrs: [(ifname, family, address, prefixlen, scope)]
+      interfaces: [(ifname, mac, state, mtu, iface_type)]
+      addrs: [(ifname, family, address, prefixlen, scope, addr_type)]
     """
     interfaces: dict[str, dict[str, object]] = {}
-    addrs: list[tuple[str, str, str, int, Optional[str]]] = []
+    addrs: list[tuple[str, str, str, int, Optional[str], str]] = []
     current_if: Optional[str] = None
 
     for line in output.splitlines():
@@ -2423,10 +3018,13 @@ def _parse_ip_a(output: str) -> tuple[list[tuple[str, Optional[str], Optional[st
                 address = m3.group(2)
                 prefixlen = int(m3.group(3))
                 scope = m3.group(4) if m3.group(4) else None
-                addrs.append((current_if, family, address, prefixlen, scope))
+                if scope is None:
+                    scope = "host" if address in ("127.0.0.1", "::1") else ("link" if (family == "inet6" and address.lower().startswith("fe80:")) else "global")
+                addr_type = _classify_addr_type(family, address)
+                addrs.append((current_if, family, address, prefixlen, scope, addr_type))
                 continue
 
-    iface_rows: list[tuple[str, Optional[str], Optional[str], Optional[int]]] = []
+    iface_rows: list[tuple[str, Optional[str], Optional[str], Optional[int], str]] = []
     for ifname, info in interfaces.items():
         iface_rows.append(
             (
@@ -2434,6 +3032,7 @@ def _parse_ip_a(output: str) -> tuple[list[tuple[str, Optional[str], Optional[st
                 info.get("mac"),  # type: ignore[arg-type]
                 info.get("state"),  # type: ignore[arg-type]
                 info.get("mtu"),  # type: ignore[arg-type]
+                _classify_iface_type(ifname),
             )
         )
     return iface_rows, addrs
@@ -2658,6 +3257,205 @@ def db_migrate(conn: sqlite3.Connection) -> None:
                 )
             """)
             conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    
+    # Migration: run_block_devices add parent_name
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_block_devices')").fetchall()]
+        if "parent_name" not in cols:
+            conn.execute("ALTER TABLE run_block_devices ADD COLUMN parent_name TEXT")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: run_failed_logins add state_text
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_failed_logins')").fetchall()]
+        if "state_text" not in cols:
+            conn.execute("ALTER TABLE run_failed_logins ADD COLUMN state_text TEXT")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: ref_tty table (for TTY correlation)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ref_tty (tty_value TEXT PRIMARY KEY, tty_kind TEXT)"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: run_hostinfo add os_name, os_version, os_id
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_hostinfo')").fetchall()]
+        for col in ("os_name", "os_version", "os_id"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE run_hostinfo ADD COLUMN {col} TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: run_group_members add member_uid
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_group_members')").fetchall()]
+        if "member_uid" not in cols:
+            conn.execute("ALTER TABLE run_group_members ADD COLUMN member_uid INTEGER")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: run_groups add group_type
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_groups')").fetchall()]
+        if "group_type" not in cols:
+            conn.execute("ALTER TABLE run_groups ADD COLUMN group_type TEXT")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: run_interface_addrs add addr_type
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_interface_addrs')").fetchall()]
+        if "addr_type" not in cols:
+            conn.execute("ALTER TABLE run_interface_addrs ADD COLUMN addr_type TEXT")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: run_interfaces add iface_type
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_interfaces')").fetchall()]
+        if "iface_type" not in cols:
+            conn.execute("ALTER TABLE run_interfaces ADD COLUMN iface_type TEXT")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: run_ip_neigh add ip_type
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_ip_neigh')").fetchall()]
+        if "ip_type" not in cols:
+            conn.execute("ALTER TABLE run_ip_neigh ADD COLUMN ip_type TEXT")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: run_containers table (per-container rows from docker/podman ps -a)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS run_containers (
+              container_row_id INTEGER PRIMARY KEY,
+              run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+              runtime TEXT NOT NULL,
+              container_id TEXT,
+              image TEXT,
+              status TEXT,
+              names TEXT,
+              created_text TEXT,
+              ports_text TEXT,
+              raw_line TEXT,
+              UNIQUE(run_id, runtime, container_id)
+            )
+            """
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: run_routes add dest_type
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_routes')").fetchall()]
+        if "dest_type" not in cols:
+            conn.execute("ALTER TABLE run_routes ADD COLUMN dest_type TEXT")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    # Migration: run_listening_sockets add bind_scope
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_listening_sockets')").fetchall()]
+        if "bind_scope" not in cols:
+            conn.execute("ALTER TABLE run_listening_sockets ADD COLUMN bind_scope TEXT")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    # Migration: run_services_systemctl add unit_type
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_services_systemctl')").fetchall()]
+        if "unit_type" not in cols:
+            conn.execute("ALTER TABLE run_services_systemctl ADD COLUMN unit_type TEXT")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    # Migration: run_systemd_enabled_unit_files add unit_type
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_systemd_enabled_unit_files')").fetchall()]
+        if "unit_type" not in cols:
+            conn.execute("ALTER TABLE run_systemd_enabled_unit_files ADD COLUMN unit_type TEXT")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    # Migration: run_priv_groups add group_type
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_priv_groups')").fetchall()]
+        if "group_type" not in cols:
+            conn.execute("ALTER TABLE run_priv_groups ADD COLUMN group_type TEXT")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    # Migration: run_usb_devices add device_class_label
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_usb_devices')").fetchall()]
+        if "device_class_label" not in cols:
+            conn.execute("ALTER TABLE run_usb_devices ADD COLUMN device_class_label TEXT")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    # Migration: run_sudoers_rules add rule_type
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_sudoers_rules')").fetchall()]
+        if "rule_type" not in cols:
+            conn.execute("ALTER TABLE run_sudoers_rules ADD COLUMN rule_type TEXT")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: ref_firewall_type and run_firewall_rules chain/target
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS ref_firewall_type (source_tag TEXT PRIMARY KEY, description TEXT)")
+        for tag, desc in [
+            ("iptables_s", "iptables save-style rules (-S)"),
+            ("iptables_list", "iptables list (-L -n -v)"),
+            ("ufw_raw", "UFW raw iptables rules"),
+            ("firewalld_zones", "firewalld zone configuration"),
+        ]:
+            conn.execute("INSERT OR IGNORE INTO ref_firewall_type(source_tag, description) VALUES (?, ?)", (tag, desc))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_firewall_rules')").fetchall()]
+        for col, typ in [("chain", "TEXT"), ("target", "TEXT")]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE run_firewall_rules ADD COLUMN {col} {typ}")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: ref_permissions and run_file_listings new columns
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS ref_permissions (perm_rwx TEXT PRIMARY KEY, perm_octal INTEGER, perm_kind TEXT)")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('run_file_listings')").fetchall()]
+        for col, typ in [("perm_octal", "INTEGER"), ("mtime_normalized_utc", "TEXT"), ("filename", "TEXT"), ("is_symlink", "INTEGER"), ("symlink_target", "TEXT")]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE run_file_listings ADD COLUMN {col} {typ}")
+        conn.commit()
     except sqlite3.OperationalError:
         pass
     
@@ -3332,6 +4130,69 @@ def _asset_has_inventory(conn: sqlite3.Connection, asset_id: int) -> bool:
     return row is not None
 
 
+def sync_asset_inventory_from_runs(conn: sqlite3.Connection) -> None:
+    """
+    Populate or update asset_inventory from run_* tables using v_host_inventory_current.
+    Ensures every asset that has at least one baseline run gets inventory derived from that run.
+    """
+    conn.execute(
+        """
+        INSERT INTO asset_inventory (
+          asset_id, server_manufacturer, server_model_series, server_model_no,
+          proc_manufacturer, proc_model_series, proc_model_no, proc_no_cores, proc_count,
+          gpu_manufacturer, gpu_model_series, gpu_model_no, gpu_count,
+          memory_capacity_gb,
+          storage_hdd_no_drives, storage_hdd_capacity_gb,
+          storage_nvme_no_drives, storage_nvme_capacity_gb,
+          storage_ssd_no_drives, storage_ssd_capacity_gb,
+          os_name, os_version, arch,
+          primary_ip, interface, mac_addr, vlan, last_updated
+        )
+        SELECT
+          a.asset_id,
+          v.server_manufacturer, v.server_model_series, v.server_model_no,
+          v.proc_manufacturer, v.proc_model_series, v.proc_model_no, v.proc_no_cores, v.proc_count,
+          v.gpu_manufacturer, v.gpu_model_series, v.gpu_model_no, v.gpu_count,
+          v.memory_capacity_gb,
+          v.storage_hdd_no_drives, v.storage_hdd_capacity_gb,
+          v.storage_nvme_no_drives, v.storage_nvme_capabity_gb,
+          v.storage_ssd_no_drives, v.storage_ssd_capabity_gb,
+          v.os_name, v.os_version, v.arch,
+          v.primary_ip, v.interface, v.mac_addr,
+          NULL, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        FROM assets a
+        JOIN v_host_inventory_current v ON v.hostname = a.hostname
+        ON CONFLICT(asset_id) DO UPDATE SET
+          server_manufacturer=excluded.server_manufacturer,
+          server_model_series=excluded.server_model_series,
+          server_model_no=excluded.server_model_no,
+          proc_manufacturer=excluded.proc_manufacturer,
+          proc_model_series=excluded.proc_model_series,
+          proc_model_no=excluded.proc_model_no,
+          proc_no_cores=excluded.proc_no_cores,
+          proc_count=excluded.proc_count,
+          gpu_manufacturer=excluded.gpu_manufacturer,
+          gpu_model_series=excluded.gpu_model_series,
+          gpu_model_no=excluded.gpu_model_no,
+          gpu_count=excluded.gpu_count,
+          memory_capacity_gb=excluded.memory_capacity_gb,
+          storage_hdd_no_drives=excluded.storage_hdd_no_drives,
+          storage_hdd_capacity_gb=excluded.storage_hdd_capacity_gb,
+          storage_nvme_no_drives=excluded.storage_nvme_no_drives,
+          storage_nvme_capacity_gb=excluded.storage_nvme_capacity_gb,
+          storage_ssd_no_drives=excluded.storage_ssd_no_drives,
+          storage_ssd_capacity_gb=excluded.storage_ssd_capacity_gb,
+          os_name=excluded.os_name,
+          os_version=excluded.os_version,
+          arch=excluded.arch,
+          primary_ip=excluded.primary_ip,
+          interface=excluded.interface,
+          mac_addr=excluded.mac_addr,
+          last_updated=excluded.last_updated
+        """
+    )
+
+
 def get_asset_identity_conflicts(conn: sqlite3.Connection) -> list[dict]:
     """
     Diagnostic function: returns identifiers that map to multiple assets,
@@ -3606,7 +4467,7 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
             try:
                 iface_rows, addr_rows = _parse_ip_a(pc.output_text)
                 ifname = None
-                for (ifn, fam, addr, _pref, _scope) in addr_rows:
+                for (ifn, fam, addr, _pref, _scope, _addr_type) in addr_rows:
                     if fam == "inet" and addr == source_ip:
                         ifname = ifn
                         break
@@ -3657,19 +4518,66 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
     cmd_by_tag: dict[str, str] = {}
     for pc in parsed_cmds:
         # keep first occurrence (script contains some loops that repeat structure)
-        cmd_by_tag.setdefault(pc.command_tag, pc.output_text)
+        if pc.command_tag == "getcap_r":
+            # Merge multiple getcap blocks (baseline may run getcap on several paths)
+            existing = cmd_by_tag.get("getcap_r", "")
+            if existing:
+                cmd_by_tag["getcap_r"] = existing + "\n" + pc.output_text
+            else:
+                cmd_by_tag["getcap_r"] = pc.output_text
+        else:
+            cmd_by_tag.setdefault(pc.command_tag, pc.output_text)
 
     # hostnamectl
     hc_out = cmd_by_tag.get("hostnamectl")
+    domain = None
+    fqdn = None
     if hc_out:
         kv = _parse_hostnamectl_kv(hc_out)
+        
+        # Extract domain and fqdn from hostnamectl output
+        static_hostname = kv.get("Static hostname", "")
+        transient_hostname = kv.get("Transient hostname", "")
+        # Some systems show "FQDN" field, others we derive from hostname
+        fqdn_field = kv.get("FQDN") or kv.get("DNS Domain") or kv.get("Domain")
+        
+        if fqdn_field:
+            fqdn = fqdn_field.strip()
+        elif static_hostname and "." in static_hostname:
+            fqdn = static_hostname.strip()
+        elif transient_hostname and "." in transient_hostname:
+            fqdn = transient_hostname.strip()
+        
+        # Extract domain from FQDN or from separate domain field
+        if fqdn:
+            if "." in fqdn:
+                parts = fqdn.split(".", 1)
+                if len(parts) > 1:
+                    domain = parts[1].strip()
+        elif kv.get("DNS Domain"):
+            domain = kv.get("DNS Domain").strip()
+        elif kv.get("Domain"):
+            domain = kv.get("Domain").strip()
+        
+        # Parse OS name/version/id from etc_release if available (for normalized fields)
+        os_name = None
+        os_version = None
+        os_id = None
+        etc_release = cmd_by_tag.get("etc_release")
+        if etc_release:
+            release_kv = _parse_os_release_kv(etc_release)
+            os_name = release_kv.get("NAME") or release_kv.get("DISTRIB_ID")
+            os_version = release_kv.get("VERSION_ID") or release_kv.get("DISTRIB_RELEASE") or release_kv.get("VERSION")
+            os_id = release_kv.get("ID") or release_kv.get("DISTRIB_ID")
+
         conn.execute(
             """
             INSERT INTO run_hostinfo(
               run_id, static_hostname, icon_name, chassis, machine_id, boot_id,
-              operating_system, kernel, architecture, hardware_vendor, hardware_model
+              operating_system, os_name, os_version, os_id, kernel, architecture,
+              hardware_vendor, hardware_model
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -3679,12 +4587,32 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
                 kv.get("Machine ID"),
                 kv.get("Boot ID"),
                 kv.get("Operating System"),
+                os_name,
+                os_version,
+                os_id,
                 kv.get("Kernel"),
                 kv.get("Architecture"),
                 kv.get("Hardware Vendor"),
                 kv.get("Hardware Model"),
             ),
         )
+        
+        # Update assets table with domain and fqdn
+        if domain or fqdn:
+            update_fields = []
+            update_values = []
+            if domain:
+                update_fields.append("domain = ?")
+                update_values.append(domain)
+            if fqdn:
+                update_fields.append("fqdn = ?")
+                update_values.append(fqdn)
+            if update_fields:
+                update_values.append(asset_id)
+                conn.execute(
+                    f"UPDATE assets SET {', '.join(update_fields)}, updated_at_utc = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE asset_id = ?",
+                    update_values,
+                )
 
         # Also store a couple easy facts for querying
         if kv.get("Operating System"):
@@ -3815,14 +4743,15 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
         conn.executemany(
             """
             INSERT OR REPLACE INTO run_block_devices(
-              run_id, name, type, size_bytes, rm, ro, mountpoints, raw_line
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              run_id, name, type, parent_name, size_bytes, rm, ro, mountpoints, raw_line
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
                     run_id,
                     r["name"],
                     r.get("type"),
+                    r.get("parent_name"),
                     r.get("size_bytes"),
                     r.get("rm"),
                     r.get("ro"),
@@ -3910,6 +4839,43 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
             ],
         )
 
+    # lshw -disable dmi -> hardware device tree (one row per device)
+    lshw_out = cmd_by_tag.get("lshw_disable_dmi")
+    if lshw_out:
+        lshw_devices = _parse_lshw(lshw_out)
+        if lshw_devices:
+            conn.executemany(
+                """
+                INSERT INTO run_lshw_devices(
+                  run_id, depth, class, logical_name, description, product, vendor,
+                  physical_id, bus_info, slot, size, capacity, serial, version,
+                  width_bits, clock_hz, raw_line
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        run_id,
+                        d["depth"],
+                        d["class"],
+                        d.get("logical_name"),
+                        d.get("description"),
+                        d.get("product"),
+                        d.get("vendor"),
+                        d.get("physical_id"),
+                        d.get("bus_info"),
+                        d.get("slot"),
+                        d.get("size"),
+                        d.get("capacity"),
+                        d.get("serial"),
+                        d.get("version"),
+                        d.get("width_bits"),
+                        d.get("clock_hz"),
+                        d.get("raw_line"),
+                    )
+                    for d in lshw_devices
+                ],
+            )
+
     # lsusb -v -> USB devices (security-relevant)
     usb = cmd_by_tag.get("lsusb_v")
     if usb:
@@ -3919,9 +4885,9 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
                 """
                 INSERT OR REPLACE INTO run_usb_devices(
                   run_id, bus_number, device_number, vendor_id, product_id,
-                  device_class, device_subclass, device_protocol, vendor_name,
-                  product_name, manufacturer, product, serial_number, usb_version, max_power
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  device_class, device_subclass, device_protocol, device_class_label,
+                  vendor_name, product_name, manufacturer, product, serial_number, usb_version, max_power
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -3933,6 +4899,7 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
                         d.get("device_class"),
                         d.get("device_subclass"),
                         d.get("device_protocol"),
+                        _usb_device_class_label(d.get("device_class")),
                         d.get("vendor_name"),
                         d.get("product_name"),
                         d.get("manufacturer"),
@@ -3958,8 +4925,8 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
     if grp:
         rows = _parse_group(grp)
         conn.executemany(
-            "INSERT OR REPLACE INTO run_groups(run_id, groupname, gid, members_csv) VALUES (?, ?, ?, ?)",
-            [(run_id, *r) for r in rows],
+            "INSERT OR REPLACE INTO run_groups(run_id, groupname, gid, members_csv, group_type) VALUES (?, ?, ?, ?, ?)",
+            [(run_id, gname, gid, members, _classify_group_type(gname, gid)) for (gname, gid, members) in rows],
         )
         # Normalize membership for joins
         member_rows = []
@@ -4097,8 +5064,8 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO run_failed_logins(
-                  run_id, username, remote_host, tty, attempt_time_utc, raw_start_text, raw_line
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                  run_id, username, remote_host, tty, state_text, attempt_time_utc, raw_start_text, raw_line
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -4106,6 +5073,7 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
                         fl.get("username"),
                         fl.get("remote_host"),
                         fl.get("tty"),
+                        fl.get("state_text"),
                         fl.get("attempt_time_utc"),
                         fl.get("raw_start_text"),
                         fl.get("raw_line"),
@@ -4113,6 +5081,15 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
                     for fl in failed_logins
                 ],
             )
+            # Upsert observed TTY values into ref_tty for correlation
+            for fl in failed_logins:
+                tty_val = (fl.get("tty") or "").strip()
+                if tty_val:
+                    tty_kind = "ssh" if tty_val.lower() == "ssh" else "pts" if "pts" in tty_val else "tty" if tty_val.startswith("tty") else "console" if "console" in tty_val.lower() else "other"
+                    conn.execute(
+                        "INSERT OR IGNORE INTO ref_tty(tty_value, tty_kind) VALUES (?, ?)",
+                        (tty_val, tty_kind),
+                    )
 
     # auditctl -s
     auds = cmd_by_tag.get("auditctl_s")
@@ -4190,6 +5167,73 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
             conn.execute(
                 "INSERT OR REPLACE INTO run_facts(run_id, fact_group, fact_key, fact_value) VALUES (?, 'journald', ?, ?)",
                 (run_id, k, v),
+            )
+
+    # NTP/Chrony/timesyncd server configuration
+    ntp_conf = cmd_by_tag.get("ntp_conf")
+    if ntp_conf:
+        ntp_servers = _parse_ntp_conf(ntp_conf)
+        if ntp_servers:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO run_ntp_servers(
+                  run_id, server_type, server_address, options, pool
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        run_id,
+                        s["server_type"],
+                        s["server_address"],
+                        s.get("options"),
+                        s.get("pool", False),
+                    )
+                    for s in ntp_servers
+                ],
+            )
+
+    chrony_conf = cmd_by_tag.get("chrony_conf")
+    if chrony_conf:
+        chrony_servers = _parse_chrony_conf(chrony_conf)
+        if chrony_servers:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO run_ntp_servers(
+                  run_id, server_type, server_address, options, pool
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        run_id,
+                        s["server_type"],
+                        s["server_address"],
+                        s.get("options"),
+                        s.get("pool", False),
+                    )
+                    for s in chrony_servers
+                ],
+            )
+
+    timesyncd_conf = cmd_by_tag.get("timesyncd_conf")
+    if timesyncd_conf:
+        timesyncd_servers = _parse_timesyncd_conf(timesyncd_conf)
+        if timesyncd_servers:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO run_ntp_servers(
+                  run_id, server_type, server_address, options, pool
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        run_id,
+                        s["server_type"],
+                        s["server_address"],
+                        s.get("options"),
+                        s.get("pool", False),
+                    )
+                    for s in timesyncd_servers
+                ],
             )
 
     # login.defs: password policy etc.
@@ -4299,18 +5343,19 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
     if neigh:
         rows = _parse_ip_neigh(neigh)
         conn.executemany(
-            "INSERT OR REPLACE INTO run_ip_neigh(run_id, ip, dev, lladdr, state, raw_line) VALUES (?, ?, ?, ?, ?, ?)",
-            [(run_id, r.get("ip"), r.get("dev"), r.get("lladdr"), r.get("state"), r.get("raw_line")) for r in rows],
+            "INSERT OR REPLACE INTO run_ip_neigh(run_id, ip, dev, lladdr, state, ip_type, raw_line) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(run_id, r.get("ip"), r.get("dev"), r.get("lladdr"), r.get("state"), r.get("ip_type"), r.get("raw_line")) for r in rows],
         )
     rt = cmd_by_tag.get("route_n")
     if rt:
         rows = _parse_route_n(rt)
-        conn.executemany(
-            """
-            INSERT OR REPLACE INTO run_routes(run_id, destination, gateway, genmask, flags, metric, ref, use, iface, raw_line)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
+        for r in rows:
+            dest_type = _classify_route_dest(r.get("destination"))
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO run_routes(run_id, destination, gateway, genmask, flags, metric, ref, use, iface, dest_type, raw_line)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     run_id,
                     r.get("destination"),
@@ -4321,11 +5366,10 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
                     r.get("ref"),
                     r.get("use"),
                     r.get("iface"),
+                    dest_type,
                     r.get("raw_line"),
-                )
-                for r in rows
-            ],
-        )
+                ),
+            )
 
     # Derive and store network posture insights
     resolv_entries = []
@@ -4385,26 +5429,71 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
     psout = cmd_by_tag.get("ps_elf")
     if psout:
         rows = _parse_ps_elf(psout)
+        
+        # Get system timezone for timestamp normalization
+        timezone_str = None
+        td_row = conn.execute("SELECT time_zone FROM run_timedate WHERE run_id = ?", (run_id,)).fetchone()
+        if td_row and td_row[0]:
+            timezone_str = td_row[0]
+        
+        # Get collected_at for timestamp normalization
+        collected_at_str = conn.execute("SELECT collected_at_utc FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        collected_at_str = collected_at_str[0] if collected_at_str else ""
+        
+        # Build parent process lookup dictionary (pid -> process details)
+        parent_lookup: dict[int, tuple[str, str]] = {}
+        for r in rows:
+            pid = r.get("pid")
+            if pid:
+                parent_lookup[pid] = (r.get("process_name", ""), r.get("process_path", ""))
+        
+        # Prepare rows with parent process info and normalized timestamps
+        process_rows = []
+        for r in rows:
+            pid = r.get("pid")
+            ppid = r.get("ppid")
+            start_time = r.get("start", "")
+            
+            # Look up parent process info
+            parent_process_name = ""
+            parent_process_path = ""
+            if ppid and ppid in parent_lookup:
+                parent_process_name, parent_process_path = parent_lookup[ppid]
+            
+            # Normalize start timestamp
+            start_normalized_utc = None
+            if start_time:
+                start_normalized_utc = normalize_timestamp_with_timezone(start_time, timezone_str, collected_at_str)
+            
+            process_rows.append((
+                run_id,
+                pid,
+                ppid,
+                r.get("uid"),
+                r.get("tty"),
+                r.get("stat"),
+                start_time,
+                start_normalized_utc,
+                r.get("time"),
+                r.get("cmd"),
+                r.get("process_name"),
+                r.get("process_path"),
+                r.get("process_arguments"),
+                parent_process_name,
+                parent_process_path,
+                r.get("raw_line"),
+            ))
+        
         conn.executemany(
             """
-            INSERT OR REPLACE INTO run_processes(run_id, pid, ppid, uid, tty, stat, start, time, cmd, raw_line)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO run_processes(
+              run_id, pid, ppid, uid, tty, stat, start, start_normalized_utc, time, cmd,
+              process_name, process_path, process_arguments,
+              parent_process_name, parent_process_path, raw_line
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            [
-                (
-                    run_id,
-                    r.get("pid"),
-                    r.get("ppid"),
-                    r.get("uid"),
-                    r.get("tty"),
-                    r.get("stat"),
-                    r.get("start"),
-                    r.get("time"),
-                    r.get("cmd"),
-                    r.get("raw_line"),
-                )
-                for r in rows
-            ],
+            process_rows,
         )
     pt = cmd_by_tag.get("pstree")
     if pt:
@@ -4498,6 +5587,10 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
         )
 
     # Persistence surfaces / file listings
+    td_row = conn.execute("SELECT time_zone FROM run_timedate WHERE run_id = ?", (run_id,)).fetchone()
+    timezone_str = td_row[0] if td_row else None
+    collected_row = conn.execute("SELECT collected_at_utc FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    collected_at_str = collected_row[0] if collected_row else None
     for tag, source in (
         ("ls_etc_cron", "cron_dirs"),
         ("ls_var_spool_cron", "cron_dirs"),
@@ -4509,30 +5602,24 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
         out = cmd_by_tag.get(tag)
         if out:
             rows = _parse_ls_latR(out)
-            conn.executemany(
-                """
-                INSERT OR REPLACE INTO run_file_listings(
-                  run_id, source, directory, path, perms, owner, grp, size_bytes, mtime_text, name, file_type, raw_line
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
+            for r in rows:
+                perms = r.get("perms")
+                if perms:
+                    conn.execute("INSERT OR IGNORE INTO ref_permissions(perm_rwx, perm_octal, perm_kind) VALUES (?, ?, ?)", (perms, r.get("perm_octal"), r.get("file_type")))
+                mtime_norm = _normalize_mtime_file(r.get("mtime_text"), timezone_str, collected_at_str)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO run_file_listings(
+                      run_id, source, directory, path, perms, perm_octal, owner, grp, size_bytes,
+                      mtime_text, mtime_normalized_utc, name, filename, file_type, is_symlink, symlink_target, raw_line
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
                     (
-                        run_id,
-                        source,
-                        r.get("directory"),
-                        r.get("path"),
-                        r.get("perms"),
-                        r.get("owner"),
-                        r.get("grp"),
-                        r.get("size_bytes"),
-                        r.get("mtime_text"),
-                        r.get("name"),
-                        r.get("file_type"),
-                        r.get("raw_line"),
-                    )
-                    for r in rows
-                ],
-            )
+                        run_id, source, r.get("directory"), r.get("path"), r.get("perms"), r.get("perm_octal"),
+                        r.get("owner"), r.get("grp"), r.get("size_bytes"), r.get("mtime_text"), mtime_norm,
+                        r.get("name"), r.get("filename"), r.get("file_type"), r.get("is_symlink"), r.get("symlink_target"), r.get("raw_line"),
+                    ),
+                )
 
     # Derive and store persistence insights
     # Get all file listings for this run
@@ -4573,29 +5660,24 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
     rb = cmd_by_tag.get("recent_bins")
     if rb:
         rows = _parse_ls_l(rb)
-        conn.executemany(
-            """
-            INSERT OR REPLACE INTO run_file_listings(
-              run_id, source, directory, path, perms, owner, grp, size_bytes, mtime_text, name, file_type, raw_line
-            ) VALUES (?, 'recent_bins', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
+        for r in rows:
+            perms = r.get("perms")
+            if perms:
+                conn.execute("INSERT OR IGNORE INTO ref_permissions(perm_rwx, perm_octal, perm_kind) VALUES (?, ?, ?)", (perms, r.get("perm_octal"), r.get("file_type")))
+            mtime_norm = _normalize_mtime_file(r.get("mtime_text"), timezone_str, collected_at_str)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO run_file_listings(
+                  run_id, source, directory, path, perms, perm_octal, owner, grp, size_bytes,
+                  mtime_text, mtime_normalized_utc, name, filename, file_type, is_symlink, symlink_target, raw_line
+                ) VALUES (?, 'recent_bins', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
-                    run_id,
-                    r.get("directory"),
-                    r.get("path"),
-                    r.get("perms"),
-                    r.get("owner"),
-                    r.get("grp"),
-                    r.get("size_bytes"),
-                    r.get("mtime_text"),
-                    r.get("name"),
-                    r.get("file_type"),
-                    r.get("raw_line"),
-                )
-                for r in rows
-            ],
-        )
+                    run_id, r.get("directory"), r.get("path"), r.get("perms"), r.get("perm_octal"),
+                    r.get("owner"), r.get("grp"), r.get("size_bytes"), r.get("mtime_text"), mtime_norm,
+                    r.get("name"), r.get("filename"), r.get("file_type"), r.get("is_symlink"), r.get("symlink_target"), r.get("raw_line"),
+                ),
+            )
 
     # ld.so.preload (high-signal preload hook surface)
     ldp = cmd_by_tag.get("ld_so_preload")
@@ -4617,13 +5699,51 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
                 [(run_id, p, c) for (p, c) in cap_rows],
             )
 
-    # Container runtimes (best-effort summaries)
+    # Container runtimes (best-effort summaries + per-container rows)
     def _count_container_rows(out: str) -> int:
         lines = [ln for ln in out.splitlines() if ln.strip()]
-        # common header lines
         lines = [ln for ln in lines if not ln.upper().startswith("CONTAINER ID")]
         lines = [ln for ln in lines if not ln.startswith("Error:")]
         return max(0, len(lines) - 0)
+
+    def _parse_containers_ps_a(output: str) -> list[dict[str, Optional[str]]]:
+        """Parse docker ps -a / podman ps -a output into rows (container_id, image, status, names, ...)."""
+        rows: list[dict[str, Optional[str]]] = []
+        for line in output.splitlines():
+            line = line.strip()
+            if not line or line.upper().startswith("CONTAINER ID") or line.startswith("Error:"):
+                continue
+            m = re.match(r"^([0-9a-f]{12})\s+(.+)", line)
+            if not m:
+                continue
+            cid, rest = m.group(1), m.group(2)
+            # Last column is typically NAMES; before that PORTS, then STATUS (Up X / Exited (code) X)
+            parts = [p.strip() for p in re.split(r"\s{2,}", rest)]
+            names = parts[-1] if parts else None
+            image = parts[0] if parts else None
+            status = None
+            if "Up " in rest:
+                sm = re.search(r"(Up\s+[\d]+\s+\w+(?:\s+[\d]+\s+\w+)?)", rest)
+                if sm:
+                    status = sm.group(1).strip()
+            elif "Exited " in rest:
+                em = re.search(r"(Exited\s+\([^)]+\)[^0-9]*(?:\d+\s+\w+\s+ago)?)", rest)
+                if em:
+                    status = em.group(1).strip()
+            created_text = None
+            cm = re.search(r"(\d+\s+(?:months?|days?|weeks?|hours?)\s+ago)", rest)
+            if cm:
+                created_text = cm.group(1).strip()
+            rows.append({
+                "container_id": cid,
+                "image": image,
+                "status": status,
+                "names": names,
+                "created_text": created_text,
+                "ports_text": None,
+                "raw_line": line,
+            })
+        return rows
 
     dps = cmd_by_tag.get("docker_ps_a")
     if dps:
@@ -4631,22 +5751,25 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
             "INSERT OR REPLACE INTO run_container_summary(run_id, runtime, k, v) VALUES (?, 'docker', 'containers_ps_a_count', ?)",
             (run_id, str(_count_container_rows(dps))),
         )
+        for c in _parse_containers_ps_a(dps):
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO run_containers(run_id, runtime, container_id, image, status, names, created_text, ports_text, raw_line)
+                VALUES (?, 'docker', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (run_id, c.get("container_id"), c.get("image"), c.get("status"), c.get("names"),
+                 c.get("created_text"), c.get("ports_text"), c.get("raw_line")),
+            )
 
     dinfo = cmd_by_tag.get("docker_info")
     if dinfo:
         kv = _parse_colon_kv_lines(dinfo)
-        # keep a small, useful subset (avoid storing huge/volatile keys)
         keep = [
-            "Server Version",
-            "Operating System",
-            "Kernel Version",
-            "Cgroup Driver",
-            "Cgroup Version",
-            "Storage Driver",
-            "Logging Driver",
-            "Security Options",
-            "Root Dir",
-            "Docker Root Dir",
+            "Server Version", "Operating System", "Kernel Version",
+            "Cgroup Driver", "Cgroup Version", "Storage Driver", "Logging Driver",
+            "Security Options", "Root Dir", "Docker Root Dir",
+            "Containers", "Containers Paused", "Containers Running", "Images",
+            "Runtimes", "Default Runtime",
         ]
         for k in keep:
             if k in kv:
@@ -4661,12 +5784,24 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
             "INSERT OR REPLACE INTO run_container_summary(run_id, runtime, k, v) VALUES (?, 'podman', 'containers_ps_a_count', ?)",
             (run_id, str(_count_container_rows(pps))),
         )
+        if "not installed" not in pps.lower():
+            for c in _parse_containers_ps_a(pps):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO run_containers(run_id, runtime, container_id, image, status, names, created_text, ports_text, raw_line)
+                    VALUES (?, 'podman', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (run_id, c.get("container_id"), c.get("image"), c.get("status"), c.get("names"),
+                     c.get("created_text"), c.get("ports_text"), c.get("raw_line")),
+                )
 
     pinfo = cmd_by_tag.get("podman_info")
     if pinfo:
         kv = _parse_colon_kv_lines(pinfo)
-        keep = ["host", "version", "store", "registries", "plugins"]
-        # podman info output is often YAML-ish; colon parsing is best-effort.
+        keep = [
+            "host", "version", "store", "registries", "plugins",
+            "os", "arch", "cpus", "memTotal", "graphDriverName", "rootless",
+        ]
         for k in keep:
             if k in kv:
                 conn.execute(
@@ -4678,10 +5813,12 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
     pg = cmd_by_tag.get("priv_groups")
     if pg:
         rows = _parse_getent_group(pg)
-        conn.executemany(
-            "INSERT OR REPLACE INTO run_priv_groups(run_id, groupname, gid, members_csv, source) VALUES (?, ?, ?, ?, 'getent')",
-            [(run_id, g, gid, members) for (g, gid, members) in rows],
-        )
+        for (g, gid, members) in rows:
+            group_type = _classify_group_type(g, gid)
+            conn.execute(
+                "INSERT OR REPLACE INTO run_priv_groups(run_id, groupname, gid, members_csv, source, group_type) VALUES (?, ?, ?, ?, 'getent', ?)",
+                (run_id, g, gid, members, group_type),
+            )
         member_rows = []
         for (groupname, _gid, members_csv) in rows:
             for member in _split_members_csv(members_csv):
@@ -4776,10 +5913,12 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
                 continue
             rules.append(s)
         if rules:
-            conn.executemany(
-                "INSERT OR REPLACE INTO run_sudoers_rules(run_id, rule_text) VALUES (?, ?)",
-                [(run_id, r) for r in sorted(set(rules))],
-            )
+            for r in sorted(set(rules)):
+                rule_type = _sudoers_rule_type(r)
+                conn.execute(
+                    "INSERT OR REPLACE INTO run_sudoers_rules(run_id, rule_text, rule_type) VALUES (?, ?, ?)",
+                    (run_id, r, rule_type),
+                )
             # derive quick flags
             nopasswd = sum(1 for r in rules if "nopasswd" in r.lower())
             all_all = sum(1 for r in rules if "ALL=(ALL" in r or "ALL = (ALL" in r)
@@ -4837,11 +5976,11 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
     if ipa:
         iface_rows, addr_rows = _parse_ip_a(ipa)
         conn.executemany(
-            "INSERT OR REPLACE INTO run_interfaces(run_id, ifname, mac_addr, state, mtu) VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO run_interfaces(run_id, ifname, mac_addr, state, mtu, iface_type) VALUES (?, ?, ?, ?, ?, ?)",
             [(run_id, *r) for r in iface_rows],
         )
         conn.executemany(
-            "INSERT OR REPLACE INTO run_interface_addrs(run_id, ifname, family, address, prefixlen, scope) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO run_interface_addrs(run_id, ifname, family, address, prefixlen, scope, addr_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
             [(run_id, *r) for r in addr_rows],
         )
 
@@ -4849,14 +5988,17 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
     ssout = cmd_by_tag.get("ss_punt")
     if ssout:
         rows = _parse_ss_punt(ssout)
-        conn.executemany(
-            """
-            INSERT OR REPLACE INTO run_listening_sockets(
-              run_id, proto, state, local_addr, local_port, peer_addr, peer_port, process_name, pid, raw_line
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [(run_id, *r) for r in rows],
-        )
+        for r in rows:
+            local_addr = r[2] if len(r) > 2 else None
+            bind_scope = _classify_bind_scope(local_addr)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO run_listening_sockets(
+                  run_id, proto, state, local_addr, local_port, peer_addr, peer_port, process_name, pid, bind_scope, raw_line
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (run_id, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], bind_scope, r[8] if len(r) > 8 else ""),
+            )
 
     # Derive and store process insights
     processes = []
@@ -4888,10 +6030,13 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
     sysu = cmd_by_tag.get("systemctl_units")
     if sysu:
         rows = _parse_systemctl_list_units(sysu)
-        conn.executemany(
-            "INSERT OR REPLACE INTO run_services_systemctl(run_id, unit, load, active, sub, description) VALUES (?, ?, ?, ?, ?, ?)",
-            [(run_id, *r) for r in rows],
-        )
+        for r in rows:
+            unit = r[0] if r else None
+            unit_type = _unit_type_from_name(unit)
+            conn.execute(
+                "INSERT OR REPLACE INTO run_services_systemctl(run_id, unit, load, active, sub, description, unit_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (run_id, r[0], r[1], r[2], r[3], r[4], unit_type),
+            )
 
     # systemctl list-timers --all
     st = cmd_by_tag.get("systemctl_timers")
@@ -4924,10 +6069,12 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
     if suf:
         rows = _parse_systemctl_list_unit_files(suf)
         if rows:
-            conn.executemany(
-                "INSERT OR REPLACE INTO run_systemd_enabled_unit_files(run_id, unit_file, state, preset) VALUES (?, ?, ?, ?)",
-                [(run_id, r.get("unit_file"), r.get("state"), r.get("preset")) for r in rows],
-            )
+            for r in rows:
+                unit_type = _unit_type_from_name(r.get("unit_file"))
+                conn.execute(
+                    "INSERT OR REPLACE INTO run_systemd_enabled_unit_files(run_id, unit_file, state, preset, unit_type) VALUES (?, ?, ?, ?, ?)",
+                    (run_id, r.get("unit_file"), r.get("state"), r.get("preset"), unit_type),
+                )
 
     # dpkg -l
     dpkg = cmd_by_tag.get("dpkg_list")
@@ -4947,35 +6094,54 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
             [(run_id, r[0]) for r in rows],
         )
 
-    # Firewall
+    # Firewall (ref_firewall_type populated in db_migrate)
+    def _parse_iptables_rule(line: str) -> tuple[Optional[str], Optional[str]]:
+        """Extract chain (-A CHAIN) and target (-j TARGET) from iptables -S style rule."""
+        chain = None
+        target = None
+        m_chain = re.search(r"^-A\s+(\S+)", line)
+        if m_chain:
+            chain = m_chain.group(1)
+        m_target = re.search(r"\s-j\s+(\S+)", line)
+        if m_target:
+            target = m_target.group(1)
+        return (chain, target)
+
     ipt_s = cmd_by_tag.get("iptables_s")
     if ipt_s:
         rules = [ln.strip() for ln in ipt_s.splitlines() if ln.strip()]
-        conn.executemany(
-            "INSERT OR REPLACE INTO run_firewall_rules(run_id, source, rule) VALUES (?, 'iptables_s', ?)",
-            [(run_id, r) for r in rules],
-        )
+        for r in rules:
+            chain, target = _parse_iptables_rule(r)
+            conn.execute(
+                "INSERT OR REPLACE INTO run_firewall_rules(run_id, source, rule, chain, target) VALUES (?, 'iptables_s', ?, ?, ?)",
+                (run_id, r, chain, target),
+            )
     ipt_l = cmd_by_tag.get("iptables_list")
     if ipt_l:
         rules = [ln.rstrip() for ln in ipt_l.splitlines() if ln.strip()]
-        conn.executemany(
-            "INSERT OR REPLACE INTO run_firewall_rules(run_id, source, rule) VALUES (?, 'iptables_list', ?)",
-            [(run_id, r) for r in rules],
-        )
+        for r in rules:
+            chain, target = _parse_iptables_rule(r)
+            conn.execute(
+                "INSERT OR REPLACE INTO run_firewall_rules(run_id, source, rule, chain, target) VALUES (?, 'iptables_list', ?, ?, ?)",
+                (run_id, r, chain, target),
+            )
     ufw_raw = cmd_by_tag.get("ufw_raw")
     if ufw_raw:
         rules = [ln.rstrip() for ln in ufw_raw.splitlines() if ln.strip()]
-        conn.executemany(
-            "INSERT OR REPLACE INTO run_firewall_rules(run_id, source, rule) VALUES (?, 'ufw_raw', ?)",
-            [(run_id, r) for r in rules],
-        )
+        for r in rules:
+            chain, target = _parse_iptables_rule(r)
+            conn.execute(
+                "INSERT OR REPLACE INTO run_firewall_rules(run_id, source, rule, chain, target) VALUES (?, 'ufw_raw', ?, ?, ?)",
+                (run_id, r, chain, target),
+            )
     fwz = cmd_by_tag.get("firewalld_zones")
     if fwz:
         rules = [ln.rstrip() for ln in fwz.splitlines() if ln.strip()]
-        conn.executemany(
-            "INSERT OR REPLACE INTO run_firewall_rules(run_id, source, rule) VALUES (?, 'firewalld_zones', ?)",
-            [(run_id, r) for r in rules],
-        )
+        for r in rules:
+            conn.execute(
+                "INSERT OR REPLACE INTO run_firewall_rules(run_id, source, rule, chain, target) VALUES (?, 'firewalld_zones', ?, NULL, NULL)",
+                (run_id, r),
+            )
 
     # nftables ruleset (best-effort)
     nft = cmd_by_tag.get("nft_ruleset")
@@ -5011,6 +6177,22 @@ def ingest_baseline_file(conn: sqlite3.Connection, file_path: Path, *, reingest:
                 for f in findings
             ],
         )
+
+    # Backfill run_group_members.member_uid from run_users for this run
+    try:
+        conn.execute(
+            """
+            UPDATE run_group_members
+            SET member_uid = (
+              SELECT u.uid FROM run_users u
+              WHERE u.run_id = run_group_members.run_id AND u.username = run_group_members.member_username
+            )
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        )
+    except sqlite3.OperationalError:
+        pass
 
     conn.commit()
     return run_id
@@ -5199,6 +6381,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             skipped += 1
         else:
             ingested += 1
+
+    sync_asset_inventory_from_runs(conn)
 
     # Lightweight summary for operator feedback
     assets = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
